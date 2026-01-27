@@ -1,0 +1,100 @@
+{
+    "global": {
+        "raw_pcap": "../data/CICIDS2017/Raw/Thursday-WorkingHours.pcap",
+        "workspace_dir": "../data/experiments/CICIDS2017_Thursday"
+    },
+    "attacks": [
+        {
+            "name": "Brute_Force",
+            "rules": [
+                {
+                    "attack_type": "Web Attack - Brute Force",
+                    "start_time": "2017-07-06 12:20",
+                    "end_time": "2017-07-06 13:00",
+                    "attackers": [
+                        "172.16.0.1"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "XSS",
+            "rules": [
+                {
+                    "attack_type": "Web Attack - XSS",
+                    "start_time": "2017-07-06 13:15",
+                    "end_time": "2017-07-06 13:35",
+                    "attackers": [
+                        "172.16.0.1"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "Sql_Injection",
+            "rules": [
+                {
+                    "attack_type": "Web Attack - Sql Injection",
+                    "start_time": "2017-07-06 13:40",
+                    "end_time": "2017-07-06 13:42",
+                    "attackers": [
+                        "172.16.0.1"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "Infiltration_1",
+            "rules": [
+                {
+                    "attack_type": "Infiltration - Dropbox download(Meta exploit Win Vista)",
+                    "start_time": "2017-07-06 17:19",
+                    "end_time": "2017-07-06 17:21",
+                    "attackers": [
+                        "205.174.165.73"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "Infiltration_2",
+            "rules": [
+                {
+                    "attack_type": "Infiltration - Dropbox download(Meta exploit Win Vista)",
+                    "start_time": "2017-07-06 17:33",
+                    "end_time": "2017-07-06 17:35",
+                    "attackers": [
+                        "205.174.165.73"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "Infiltration_3",
+            "rules": [
+                {
+                    "attack_type": "Infiltration - Cool disk",
+                    "start_time": "2017-07-06 17:53",
+                    "end_time": "2017-07-06 18:00",
+                    "attackers": [
+                        "205.174.165.73"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "Infiltration_4",
+            "rules": [
+                {
+                    "attack_type": "Infiltration - Dropbox download(Win Vista)",
+                    "start_time": "2017-07-06 18:04",
+                    "end_time": "2017-07-06 18:45",
+                    "attackers": [
+                        "205.174.165.73",
+                        "192.168.10.8"
+                    ]
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,49 @@
+{
+    "global": {
+        "raw_pcap": "../data/CICIDS2017/Raw/Friday-WorkingHours.pcap",
+        "workspace_dir": "../data/experiments/CICIDS2017_Friday/",
+        "total_budget": 15000000,
+        "attack_ratio": 0.1
+    },
+    "attacks": [
+        {
+            "name": "Botnet_ARES",
+            "rules": [
+                {
+                    "attack_type": "Botnet ARES",
+                    "start_time": "2017-07-07 13:02",
+                    "end_time": "2017-07-07 14:02",
+                    "attackers": [
+                        "205.174.165.73"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "Port_Scan",
+            "rules": [
+                {
+                    "attack_type": "Port Scan",
+                    "start_time": "2017-07-07 16:55",
+                    "end_time": "2017-07-07 18:30",
+                    "attackers": [
+                        "172.16.0.1"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "DDoS_LOIT",
+            "rules": [
+                {
+                    "attack_type": "DDoS LOIT",
+                    "start_time": "2017-07-07 18:56",
+                    "end_time": "2017-07-07 19:16",
+                    "attackers": [
+                        "172.16.0.1"
+                    ]
+                }
+            ]
+        }
+    ]
+}

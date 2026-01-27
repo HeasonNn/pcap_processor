@@ -1,0 +1,17 @@
+# rustfmt.toml (stable-friendly)
+
+edition = "2021"        # 和 Cargo.toml 保持一致
+max_width = 120         # 常用 100/120
+
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+
+# import/use 整理
+reorder_imports = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+
+# 常见尾逗号/换行行为
+trailing_comma = "Vertical"
+match_block_trailing_comma = true

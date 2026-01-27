@@ -1,0 +1,73 @@
+{
+  "global": {
+    "raw_pcap": "../data/CICIDS2017/Raw/Wednesday-workingHours.pcap",
+    "workspace_dir": "../data/experiments/CICIDS2017_Wednesday"
+  },
+  "attacks": [
+    {
+      "name": "DoS_slowloris",
+      "rules": [
+        {
+          "attack_type": "DoS_slowloris",
+          "start_time": "2017-07-05 12:47",
+          "end_time": "2017-07-05 13:10",
+          "attackers": [
+            "172.16.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "DoS_Slowhttptest",
+      "rules": [
+        {
+          "attack_type": "DoS_Slowhttptest",
+          "start_time": "2017-07-05 13:14",
+          "end_time": "2017-07-05 13:35",
+          "attackers": [
+            "172.16.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "DoS_Hulk",
+      "rules": [
+        {
+          "attack_type": "DoS_Hulk",
+          "start_time": "2017-07-05 13:43",
+          "end_time": "2017-07-05 14:00",
+          "attackers": [
+            "172.16.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "DoS_GoldenEye",
+      "rules": [
+        {
+          "attack_type": "DoS_GoldenEye",
+          "start_time": "2017-07-05 14:10",
+          "end_time": "2017-07-05 14:23",
+          "attackers": [
+            "172.16.0.1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Heartbleed_Port_444",
+      "rules": [
+        {
+          "attack_type": "Heartbleed_Port_444",
+          "start_time": "2017-07-05 18:12",
+          "end_time": "2017-07-05 18:32",
+          "attackers": [
+            "172.16.0.1"
+          ]
+        }
+      ]
+    }
+  ]
+}

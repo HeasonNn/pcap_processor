@@ -1,0 +1,106 @@
+{
+    "global": {
+        "raw_pcap": "data/raw/CICDDoS2019/PCAPs/03-11",
+        "workspace_dir": "data/experiments/CICDDoS2019_Day1/"
+    },
+    "attacks": [
+        {
+            "name": "01_PortMap",
+            "rules": [
+                {
+                    "attack_type": "PortMap",
+                    "start_time": "2018-11-03 12:18",
+                    "end_time": "2018-11-03 12:47",
+                    "attackers": [
+                        "192.168.50.1",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "02_NetBIOS",
+            "rules": [
+                {
+                    "attack_type": "NetBIOS",
+                    "start_time": "2018-11-03 12:47",
+                    "end_time": "2018-11-03 13:12",
+                    "attackers": [
+                        "192.168.50.1",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "03_LDAP",
+            "rules": [
+                {
+                    "attack_type": "LDAP",
+                    "start_time": "2018-11-03 13:21",
+                    "end_time": "2018-11-03 13:52",
+                    "attackers": [
+                        "192.168.50.1",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "04_MSSQL",
+            "rules": [
+                {
+                    "attack_type": "MSSQL",
+                    "start_time": "2018-11-03 14:06",
+                    "end_time": "2018-11-03 14:35",
+                    "attackers": [
+                        "192.168.50.1",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "05_UDP",
+            "rules": [
+                {
+                    "attack_type": "UDP",
+                    "start_time": "2018-11-03 14:36",
+                    "end_time": "2018-11-03 15:06",
+                    "attackers": [
+                        "192.168.50.1",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "06_UDPLag",
+            "rules": [
+                {
+                    "attack_type": "UDPLag",
+                    "start_time": "2018-11-03 15:06",
+                    "end_time": "2018-11-03 15:35",
+                    "attackers": [
+                        "192.168.50.1",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "07_SYN",
+            "rules": [
+                {
+                    "attack_type": "SYN",
+                    "start_time": "2018-11-03 15:36",
+                    "end_time": "2018-11-03 16:28",
+                    "attackers": [
+                        "192.168.50.1",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        }
+    ]
+}

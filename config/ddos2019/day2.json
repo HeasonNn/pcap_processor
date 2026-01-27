@@ -1,0 +1,177 @@
+{
+    "global": {
+        "raw_pcap": "data/raw/CICDDoS2019/PCAP-01-12",
+        "workspace_dir": "data/experiments/CICDDoS2019_Day2/",
+        "benign_sampling_rate": 1.0
+    },
+    "attacks": [
+        {
+            "name": "01_NTP",
+            "rules": [
+                {
+                    "attack_type": "NTP",
+                    "start_time": "2018-12-01 14:36",
+                    "end_time": "2018-12-01 14:46",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "02_DNS",
+            "rules": [
+                {
+                    "attack_type": "DNS",
+                    "start_time": "2018-12-01 14:52",
+                    "end_time": "2018-12-01 15:05",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "03_LDAP",
+            "rules": [
+                {
+                    "attack_type": "LDAP",
+                    "start_time": "2018-12-01 15:22",
+                    "end_time": "2018-12-01 15:32",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "04_MSSQL",
+            "rules": [
+                {
+                    "attack_type": "MSSQL",
+                    "start_time": "2018-12-01 15:36",
+                    "end_time": "2018-12-01 15:46",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "05_NetBIOS",
+            "rules": [
+                {
+                    "attack_type": "NetBIOS",
+                    "start_time": "2018-12-01 15:51",
+                    "end_time": "2018-12-01 16:01",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "06_SNMP",
+            "rules": [
+                {
+                    "attack_type": "SNMP",
+                    "start_time": "2018-12-01 16:06",
+                    "end_time": "2018-12-01 16:16",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "07_SSDP",
+            "rules": [
+                {
+                    "attack_type": "SSDP",
+                    "start_time": "2018-12-01 16:21",
+                    "end_time": "2018-12-01 16:31",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "08_UDP",
+            "rules": [
+                {
+                    "attack_type": "UDP",
+                    "start_time": "2018-12-01 16:36",
+                    "end_time": "2018-12-01 16:46",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "09_UDPLag",
+            "rules": [
+                {
+                    "attack_type": "UDPLag",
+                    "start_time": "2018-12-01 16:51",
+                    "end_time": "2018-12-01 17:01",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "10_WebDDoS",
+            "rules": [
+                {
+                    "attack_type": "WebDDoS",
+                    "start_time": "2018-12-01 17:06",
+                    "end_time": "2018-12-01 17:16",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "11_SYN",
+            "rules": [
+                {
+                    "attack_type": "SYN",
+                    "start_time": "2018-12-01 17:21",
+                    "end_time": "2018-12-01 17:31",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        },
+        {
+            "name": "12_TFTP",
+            "rules": [
+                {
+                    "attack_type": "TFTP",
+                    "start_time": "2018-12-01 17:36",
+                    "end_time": "2018-12-01 17:46",
+                    "attackers": [
+                        "192.168.50.4",
+                        "172.16.0.5"
+                    ]
+                }
+            ]
+        }
+    ]
+}
