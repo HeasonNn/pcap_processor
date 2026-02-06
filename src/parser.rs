@@ -1,99 +1,112 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::NaiveDateTime;
 use log::{info, warn};
 use pcap::{Capture, Linktype, Packet, Savefile};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
-use crate::common::Rule;
+use crate::common::{PacketMeta, PacketType, Rule};
 
-// =============================================================================
-// 1. 协议编码定义
-// =============================================================================
-
-const PKT_TYPE_IPV4: u8 = 0;
-const PKT_TYPE_IPV6: u8 = 1;
-const PKT_TYPE_ICMP: u8 = 2;
-const PKT_TYPE_IGMP: u8 = 3;
-const PKT_TYPE_TCP_SYN: u8 = 4;
-const PKT_TYPE_TCP_ACK: u8 = 5;
-const PKT_TYPE_TCP_FIN: u8 = 6;
-const PKT_TYPE_TCP_RST: u8 = 7;
-const PKT_TYPE_UDP: u8 = 8;
-const PKT_TYPE_UNKNOWN: u8 = 9;
-
-fn to_pkt_code(t: u8) -> u16 {
-    1 << t
+fn decode_l2(data: &[u8], link_type: Linktype) -> Option<(usize, u16)> {
+    match link_type {
+        Linktype::ETHERNET => {
+            if data.len() < 14 {
+                return None;
+            }
+            let et = u16::from_be_bytes([data[12], data[13]]);
+            if et == 0x8100 {
+                // 802.1Q VLAN: [dst6][src6][8100][tci2][etype2]
+                if data.len() < 18 {
+                    return None;
+                }
+                let et2 = u16::from_be_bytes([data[16], data[17]]);
+                Some((18, et2))
+            } else {
+                Some((14, et))
+            }
+        },
+        Linktype(113) => {
+            // SLL: protocol at bytes 14..16, payload at 16
+            if data.len() < 16 {
+                return None;
+            }
+            let proto = u16::from_be_bytes([data[14], data[15]]);
+            Some((16, proto))
+        },
+        Linktype(12) => {
+            // RAW: packet begins with IP header
+            if data.is_empty() {
+                return None;
+            }
+            let ver = data[0] >> 4;
+            let proto = match ver {
+                4 => 0x0800,
+                6 => 0x86DD,
+                _ => return None,
+            };
+            Some((0, proto))
+        },
+        _ => None,
+    }
 }
 
-fn set_pkt_code(code: &mut u16, t: u8) {
-    *code |= to_pkt_code(t);
-}
-
-// =============================================================================
-// 2. 结构化包信息
-// =============================================================================
-#[derive(Debug)]
-pub struct PacketMeta {
-    pub src_ip: IpAddr,
-    pub dst_ip: IpAddr,
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub packet_code: u16,
-    pub ip_len: u16,
-    pub ts_ns: i64,
-}
-
-// =============================================================================
-// 3. 解析逻辑
-// =============================================================================
-pub fn parse_packet(packet: &Packet, link_type: Linktype) -> Option<PacketMeta> {
-    let data = packet.data;
-    let offset;
-    let eth_type;
-
-    // --- L2: Ethernet / SLL 解析 ---
-    if link_type == Linktype::ETHERNET {
-        if data.len() < 14 {
-            return None;
-        }
-        eth_type = u16::from_be_bytes([data[12], data[13]]);
-        offset = 14;
-    } else if link_type == Linktype(113) {
-        // Linux Cooked (SLL)
-        if data.len() < 16 {
-            return None;
-        }
-        eth_type = u16::from_be_bytes([data[14], data[15]]);
-        offset = 16;
-    } else {
+/// Wrap a packet payload into a fake Ethernet frame (DLT_EN10MB).
+/// - dst MAC: ff:ff:ff:ff:ff:ff (broadcast)
+/// - src MAC: 02:00:00:00:00:01 (locally administered)
+/// - ethertype/protocol taken from link-layer framing (Ethernet/SLL) or inferred from IP version for RAW
+pub fn wrap_to_ethernet(pkt: &Packet, link_type: Linktype) -> Option<(pcap::PacketHeader, Vec<u8>)> {
+    let data = pkt.data;
+    if data.is_empty() {
         return None;
     }
 
-    // 初始化变量
+    if link_type == Linktype::ETHERNET {
+        let mut hdr = *pkt.header;
+        let out = data.to_vec();
+        hdr.caplen = out.len() as u32;
+        hdr.len = out.len() as u32;
+        return Some((hdr, out));
+    }
+
+    let (l3_off, proto) = decode_l2(data, link_type)?;
+    let payload = &data[l3_off..];
+
+    // Fake Ethernet header
+    let mut eth = Vec::with_capacity(14 + payload.len());
+    eth.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]); // dst MAC: broadcast
+    eth.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]); // src MAC: locally administered
+    eth.push((proto >> 8) as u8);
+    eth.push((proto & 0xff) as u8);
+    eth.extend_from_slice(payload);
+
+    let mut hdr = *pkt.header;
+    hdr.caplen = eth.len() as u32;
+    hdr.len = eth.len() as u32;
+    Some((hdr, eth))
+}
+
+pub fn parse_packet(packet: &Packet, link_type: Linktype) -> Option<PacketMeta> {
+    let data = packet.data;
+    let (offset, eth_type) = decode_l2(data, link_type)?;
+
     let mut packet_code: u16 = 0;
     let mut src_port: u16 = 0;
     let mut dst_port: u16 = 0;
     let packet_length: u16;
     let src_ip: IpAddr;
     let dst_ip: IpAddr;
-
-    // 用于指向 L4 协议类型的变量
     let next_proto: u8;
     let l4_offset: usize;
 
-    // --- L3: IP 解析 (设置 IPv4/IPv6 Code) ---
     match eth_type {
         0x0800 => {
-            // IPv4
             if data.len() < offset + 20 {
                 return None;
             }
 
-            set_pkt_code(&mut packet_code, PKT_TYPE_IPV4);
+            PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeIpv4);
             let ihl = (data[offset] & 0x0f) as usize * 4;
             if data.len() < offset + ihl {
                 return None;
@@ -118,14 +131,13 @@ pub fn parse_packet(packet: &Packet, link_type: Linktype) -> Option<PacketMeta> 
             l4_offset = offset + ihl;
         },
         0x86DD => {
-            // IPv6
             if data.len() < offset + 40 {
                 return None;
             }
 
-            set_pkt_code(&mut packet_code, PKT_TYPE_IPV6);
+            PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeIpv6);
             let payload_len = u16::from_be_bytes([data[offset + 4], data[offset + 5]]);
-            packet_length = payload_len + 40; // IPv6 header is 40 bytes
+            packet_length = payload_len + 40;
 
             next_proto = data[offset + 6];
 
@@ -139,63 +151,58 @@ pub fn parse_packet(packet: &Packet, link_type: Linktype) -> Option<PacketMeta> 
 
             l4_offset = offset + 40;
         },
-        _ => return None, // basic_packet_bad
+        _ => return None,
     };
 
-    // --- L4: Transport Layer 解析 (TCP/UDP/ICMP/IGMP) ---
     if data.len() > l4_offset {
         match next_proto {
             6 => {
-                // TCP
                 if data.len() >= l4_offset + 20 {
                     src_port = u16::from_be_bytes([data[l4_offset], data[l4_offset + 1]]);
                     dst_port = u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
 
                     let flags = data[l4_offset + 13];
                     if (flags & 0x02) != 0 {
-                        set_pkt_code(&mut packet_code, PKT_TYPE_TCP_SYN);
+                        PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeTcpSyn);
                     } // SYN
                     if (flags & 0x01) != 0 {
-                        set_pkt_code(&mut packet_code, PKT_TYPE_TCP_FIN);
+                        PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeTcpFin);
                     } // FIN
                     if (flags & 0x04) != 0 {
-                        set_pkt_code(&mut packet_code, PKT_TYPE_TCP_RST);
+                        PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeTcpRst);
                     } // RST
                     if (flags & 0x10) != 0 {
-                        set_pkt_code(&mut packet_code, PKT_TYPE_TCP_ACK);
+                        PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeTcpAck);
                     } // ACK
                 } else {
                     return None;
                 }
             },
             17 => {
-                // UDP
                 if data.len() >= l4_offset + 8 {
                     src_port = u16::from_be_bytes([data[l4_offset], data[l4_offset + 1]]);
                     dst_port = u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
 
-                    set_pkt_code(&mut packet_code, PKT_TYPE_UDP);
+                    PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeUdp);
                 } else {
                     return None;
                 }
             },
             1 => {
-                // ICMP
-                set_pkt_code(&mut packet_code, PKT_TYPE_ICMP);
+                PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeIcmp);
             },
             2 => {
-                // IGMP
-                set_pkt_code(&mut packet_code, PKT_TYPE_IGMP);
+                PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeIgmp);
             },
             58 => {
-                set_pkt_code(&mut packet_code, PKT_TYPE_UNKNOWN);
+                PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeUnknown);
             },
             _ => {
-                set_pkt_code(&mut packet_code, PKT_TYPE_UNKNOWN);
+                PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeUnknown);
             },
         }
     } else {
-        set_pkt_code(&mut packet_code, PKT_TYPE_UNKNOWN);
+        PacketMeta::set_pkt_code(&mut packet_code, PacketType::PktTypeUnknown);
     }
 
     Some(PacketMeta {
@@ -209,9 +216,137 @@ pub fn parse_packet(packet: &Packet, link_type: Linktype) -> Option<PacketMeta> 
     })
 }
 
-// =============================================================================
-// 4. 全局 Filter (Step 1)
-// =============================================================================
+#[derive(Debug)]
+struct HeapEntry {
+    ts_ns: u64,
+    file_idx: usize,
+    header: pcap::PacketHeader,
+    data: Vec<u8>,
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.ts_ns == other.ts_ns && self.file_idx == other.file_idx
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.ts_ns, self.file_idx).cmp(&(other.ts_ns, other.file_idx))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub fn compact_neg_pkt(neg_pcap_path: &str, output_dir: &str) -> Result<String> {
+    let input_path = Path::new(neg_pcap_path);
+    let mut files = vec![];
+    if input_path.is_dir() {
+        for entry in std::fs::read_dir(input_path)? {
+            let p = entry?.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("pcap") {
+                files.push(p);
+            }
+        }
+        files.sort_by(|a, b| natord::compare(&a.to_string_lossy(), &b.to_string_lossy()));
+    } else {
+        return Ok(neg_pcap_path.to_string());
+    }
+
+    if files.is_empty() {
+        anyhow::bail!("No pcap files found in {}", neg_pcap_path);
+    }
+
+    let output_linktype = Linktype::ETHERNET;
+    info!(
+        "🔗 NEG compact output Linktype forced to {:?} (Ethernet)",
+        output_linktype
+    );
+
+    let dead_cap = Capture::dead(output_linktype)?;
+    let neg_path = Path::new(output_dir).join("BENIGN.pcap");
+    let neg_path_str = neg_path.to_string_lossy().to_string();
+    let mut writer = dead_cap.savefile(&neg_path_str)?;
+
+    info!("⚡ Compacting {} files (timestamp-ordered merge)...", files.len());
+
+    let mut caps: Vec<Option<(Capture<pcap::Offline>, Linktype)>> = Vec::with_capacity(files.len());
+    let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::new();
+    for (i, file_path) in files.iter().enumerate() {
+        let mut cap = match Capture::from_file(file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Skipping {:?}: {}", file_path, e);
+                caps.push(None);
+                continue;
+            },
+        };
+        let lt = cap.get_datalink();
+        match cap.next_packet() {
+            Ok(pkt) => {
+                if let Some((new_hdr, new_data)) = wrap_to_ethernet(&pkt, lt) {
+                    let ts_ns = (new_hdr.ts.tv_sec as u64) * 1_000_000_000 + (new_hdr.ts.tv_usec as u64) * 1_000;
+                    heap.push(Reverse(HeapEntry {
+                        ts_ns,
+                        file_idx: i,
+                        header: new_hdr,
+                        data: new_data,
+                    }));
+                }
+                caps.push(Some((cap, lt)));
+            },
+            Err(_) => {
+                warn!("Empty pcap: {:?}", file_path);
+                caps.push(Some((cap, lt)));
+            },
+        }
+    }
+
+    let mut count: u64 = 0;
+
+    while let Some(Reverse(entry)) = heap.pop() {
+        let idx = entry.file_idx;
+        let pkt_ref = Packet {
+            header: &entry.header,
+            data: &entry.data,
+        };
+        writer.write(&pkt_ref);
+
+        count += 1;
+        if count % 5_000_000 == 0 {
+            info!("   Processed {} packets...", count);
+        }
+
+        if let Some(Some((cap, lt))) = caps.get_mut(idx) {
+            match cap.next_packet() {
+                Ok(pkt) => {
+                    if let Some((new_hdr, new_data)) = wrap_to_ethernet(&pkt, *lt) {
+                        let ts_ns = (new_hdr.ts.tv_sec as u64) * 1_000_000_000 + (new_hdr.ts.tv_usec as u64) * 1_000;
+                        heap.push(Reverse(HeapEntry {
+                            ts_ns,
+                            file_idx: idx,
+                            header: new_hdr,
+                            data: new_data,
+                        }));
+                    }
+                },
+                Err(pcap::Error::NoMorePackets) => {},
+                Err(_) => {},
+            }
+        }
+    }
+
+    writer.flush()?;
+    info!("✅ Compacted into {} ({} packets, Ethernet)", neg_path_str, count);
+    Ok(neg_path_str)
+}
+
 pub fn filter_malicious_pkt(
     raw_pcap_input: &str,
     rules: &Vec<Rule>,
@@ -239,14 +374,7 @@ pub fn filter_malicious_pkt(
         anyhow::bail!("No pcap files found in {}", raw_pcap_input);
     }
 
-    // 自动检测 Linktype
-    let first_file = &files[0];
-    let cap_test = Capture::from_file(first_file).context("Failed to open first pcap")?;
-    let global_linktype = cap_test.get_datalink();
-    info!("🔗 Detected Linktype: {:?} from {:?}", global_linktype, first_file);
-
-    let dead_cap = Capture::dead(global_linktype)?;
-
+    let dead_cap = Capture::dead(Linktype::ETHERNET)?;
     let benign_path = Path::new(output_dir).join("BENIGN.pcap");
     let benign_path_str = benign_path.to_string_lossy().to_string();
     writers.insert("BENIGN".to_string(), dead_cap.savefile(&benign_path_str)?);
@@ -266,9 +394,11 @@ pub fn filter_malicious_pkt(
         let link_type = cap.get_datalink();
 
         while let Ok(packet) = cap.next_packet() {
+            // Default label for non-IP/unparsable packets
+            let mut target_type = "BENIGN";
+
             if let Some(meta) = parse_packet(&packet, link_type) {
                 let ts_f64 = meta.ts_ns as f64 / 1e9;
-                let mut target_type = "BENIGN";
 
                 if let Some(rules) = index.get(&meta.src_ip) {
                     if let Some((_, _, t)) = rules.iter().find(|(s, e, _)| ts_f64 >= *s && ts_f64 <= *e) {
@@ -282,7 +412,9 @@ pub fn filter_malicious_pkt(
                         }
                     }
                 }
+            }
 
+            if let Some((hdr, data)) = wrap_to_ethernet(&packet, link_type) {
                 let writer = if let Some(w) = writers.get_mut(target_type) {
                     w
                 } else {
@@ -292,8 +424,14 @@ pub fn filter_malicious_pkt(
                     writers.insert(target_type.to_string(), dead_cap.savefile(path_str)?);
                     writers.get_mut(target_type).unwrap()
                 };
-                writer.write(&packet);
+
+                let pkt_ref = Packet {
+                    header: &hdr,
+                    data: &data,
+                };
+                writer.write(&pkt_ref);
             }
+
             count += 1;
             if count % 5_000_000 == 0 {
                 info!("   Processed {} packets...", count);
@@ -305,66 +443,6 @@ pub fn filter_malicious_pkt(
         w.flush()?;
     }
     Ok(generated_paths)
-}
-
-// =============================================================================
-// 5. 解析并生成 .data / .label (Step 3) - 输出格式调整
-// =============================================================================
-pub fn process_and_write(pcap_path: &str, output_prefix: &str, rules: &Vec<Rule>) -> Result<()> {
-    let index = build_ip_index(rules)?;
-    let mut data_w = BufWriter::new(File::create(format!("{}.data", output_prefix))?);
-    let mut label_w = BufWriter::new(File::create(format!("{}.label", output_prefix))?);
-
-    let mut cap = Capture::from_file(pcap_path)?;
-    let link_type = cap.get_datalink();
-    info!("   Parsing mixed pcap with Linktype: {:?}", link_type);
-
-    let mut align_time: i64 = -1;
-    let mut count = 0;
-
-    while let Ok(packet) = cap.next_packet() {
-        if let Some(meta) = parse_packet(&packet, link_type) {
-            if align_time == -1 {
-                align_time = meta.ts_ns;
-            }
-            let ts_f64 = meta.ts_ns as f64 / 1e9;
-
-            let is_src_atk = index
-                .get(&meta.src_ip)
-                .map_or(false, |rs| rs.iter().any(|(s, e, _)| ts_f64 >= *s && ts_f64 <= *e));
-            let is_dst_atk = index
-                .get(&meta.dst_ip)
-                .map_or(false, |rs| rs.iter().any(|(s, e, _)| ts_f64 >= *s && ts_f64 <= *e));
-
-            let label = if is_src_atk || is_dst_atk { b"1" } else { b"0" };
-            let rel_ts = meta.ts_ns - align_time;
-
-            writeln!(
-                data_w,
-                "{} {} {} {} {} {} {} {}",
-                if meta.src_ip.is_ipv4() { 4 } else { 6 }, // 1. Version
-                meta.src_ip,                               // 2. Src IP
-                meta.dst_ip,                               // 3. Dst IP
-                meta.src_port,                             // 4. Src Port
-                meta.dst_port,                             // 5. Dst Port
-                rel_ts,                                    // 6. Relative Time (ns)
-                meta.packet_code,                          // 7. Packet Code (Protocol + Flags Mask)
-                meta.ip_len                                // 8. Length
-            )?;
-
-            label_w.write_all(label)?;
-            count += 1;
-        }
-    }
-    data_w.flush()?;
-    label_w.flush()?;
-
-    if count == 0 {
-        warn!("⚠️ Generated dataset is empty!");
-    } else {
-        info!("   ✅ Generated {} entries.", count);
-    }
-    Ok(())
 }
 
 fn build_ip_index(rules: &Vec<Rule>) -> Result<HashMap<IpAddr, Vec<(f64, f64, String)>>> {
@@ -394,121 +472,4 @@ fn parse_time(s: &str) -> Result<f64> {
         }
     }
     anyhow::bail!("Invalid time format: {}", s)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::{self, File};
-    use std::io::BufReader;
-    use std::path::Path;
-
-    #[test]
-    fn test_verify_dataset_generation_from_json() {
-        // ================= 配置区域 =================
-        // 1. 设置文件路径
-        let pcap_path = "./data/experiments/unsw/17-2/Analysis_mixed.pcap";
-        let config_path = "config/unsw/attacks_2015-02-18.json";
-
-        // 2. 指定你要验证的场景名称 (必须与 JSON 中的 "name" 和 PCAP 文件名对应)
-        let target_scenario_name = "Analysis";
-
-        // 3. 测试输出位置
-        let output_dir = "./test_output";
-        let output_prefix = format!("{}/test_verify_real", output_dir);
-        // ===========================================
-
-        println!("🧪 Starting verification test (Real Config)...");
-        println!("   📂 Input PCAP:   {}", pcap_path);
-        println!("   📜 Config File:  {}", config_path);
-        println!("   🎯 Target Scenario: {}", target_scenario_name);
-
-        // --- 步骤 A: 检查文件存在性 ---
-        if !Path::new(pcap_path).exists() {
-            panic!(
-                "❌ Test failed: PCAP file not found at {}. Please check path.",
-                pcap_path
-            );
-        }
-        if !Path::new(config_path).exists() {
-            panic!(
-                "❌ Test failed: Config file not found at {}. Please check path.",
-                config_path
-            );
-        }
-
-        // --- 步骤 B: 从 JSON 读取并提取规则 ---
-        let file = File::open(config_path).expect("Failed to open config file");
-        let reader = BufReader::new(file);
-        let json: serde_json::Value = serde_json::from_reader(reader).expect("Failed to parse JSON");
-
-        let mut target_rules: Vec<Rule> = Vec::new();
-        let mut found_scenario = false;
-
-        // 遍历 JSON 中的 attacks 数组寻找目标场景
-        if let Some(attacks) = json.get("attacks").and_then(|a| a.as_array()) {
-            for attack in attacks {
-                if let Some(name) = attack.get("name").and_then(|n| n.as_str()) {
-                    if name == target_scenario_name {
-                        found_scenario = true;
-                        if let Some(rules_json) = attack.get("rules") {
-                            // 将 JSON 数组反序列化为 Vec<crate::Rule>
-                            target_rules = serde_json::from_value(rules_json.clone())
-                                .expect("Failed to deserialize rules for scenario");
-                            println!("   ✅ Loaded {} rules for scenario '{}'", target_rules.len(), name);
-                        }
-                        break; // 找到了就退出循环
-                    }
-                }
-            }
-        }
-
-        if !found_scenario {
-            panic!("❌ Scenario '{}' not found in config file!", target_scenario_name);
-        }
-        if target_rules.is_empty() {
-            println!("⚠️ Warning: The target scenario has NO rules. .data will likely be all 0 labels.");
-        }
-
-        // --- 步骤 C: 执行处理 ---
-        if !Path::new(output_dir).exists() {
-            fs::create_dir_all(output_dir).expect("Failed to create test output dir");
-        }
-
-        let result = process_and_write(pcap_path, &output_prefix, &target_rules);
-        assert!(
-            result.is_ok(),
-            "❌ process_and_write returned error: {:?}",
-            result.err()
-        );
-
-        // --- 步骤 D: 验证结果 ---
-        let data_path = format!("{}.data", output_prefix);
-        let label_path = format!("{}.label", output_prefix);
-
-        let data_meta = fs::metadata(&data_path).expect("❌ .data file missing");
-        let label_meta = fs::metadata(&label_path).expect("❌ .label file missing");
-
-        println!("------------------------------------------------");
-        println!("📊 Result Statistics:");
-        println!("   Data File Size:  {} bytes", data_meta.len());
-        println!("   Label File Size: {} bytes", label_meta.len());
-        println!("------------------------------------------------");
-
-        assert!(data_meta.len() > 0, "❌ FAILURE: .data file is empty! Parsing failed.");
-        assert!(label_meta.len() > 0, "❌ FAILURE: .label file is empty!");
-
-        let label_content = fs::read(&label_path).unwrap();
-        let attack_count = label_content.iter().filter(|&&b| b == b'1').count();
-        println!(
-            "🔎 Found {} attack packets (Label '1') in generated dataset.",
-            attack_count
-        );
-
-        if attack_count == 0 {
-            println!("⚠️ Note: No attack packets were identified. Check if timestamps/IPs in JSON match the PCAP.");
-        } else {
-            println!("🎉 SUCCESS: Identified {} malicious packets!", attack_count);
-        }
-    }
 }

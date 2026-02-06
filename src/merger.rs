@@ -9,80 +9,70 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use crate::common::FlowKey;
-
-// =============================================================================
-// 1. 定义 Merge Trait
-// =============================================================================
+use crate::export::DatasetWriter;
 
 pub trait MergeStrategy {
-    fn execute(&self, output_path: &str) -> Result<usize>;
+    fn execute(&self, output_prefix_str: &str) -> Result<usize>;
 }
 
-// =============================================================================
-// 2. 策略一：基于哈希的一致性采样
-// =============================================================================
-
 pub struct HashSamplingStrategy {
-    attack_pattern: String,
-    benign_pattern: String,
+    attack_str: String,
+    benign_str: String,
     sampling_rate: f64,
 }
 
 impl HashSamplingStrategy {
-    pub fn new(attack_pattern: &str, benign_pattern: &str, sampling_rate: f64) -> Self {
+    pub fn new(attack_str: &str, benign_str: &str, sampling_rate: f64) -> Self {
         Self {
-            attack_pattern: attack_pattern.to_string(),
-            benign_pattern: benign_pattern.to_string(),
+            attack_str: attack_str.to_string(),
+            benign_str: benign_str.to_string(),
             sampling_rate,
         }
     }
 }
 
 impl MergeStrategy for HashSamplingStrategy {
-    fn execute(&self, output_path: &str) -> Result<usize> {
+    fn execute(&self, output_prefix_str: &str) -> Result<usize> {
         info!(
             "🚀 Running Merge: Hash-based Sampling Mode (Rate: {:.2})",
             self.sampling_rate
         );
 
-        // 1. 初始化输入流
-        let mut atk_stream = PcapStreamer::new(&self.attack_pattern, false)?;
-        let mut ben_stream = PcapStreamer::new(&self.benign_pattern, true)?;
-        ben_stream.scan_duration()?; // 背景流量需要循环播放，需扫描时长
+        let mut atk_stream = PcapStreamer::new(&self.attack_str, false)?;
+        let mut ben_stream = PcapStreamer::new(&self.benign_str, true)?;
+        ben_stream.scan_duration()?;
 
-        let out_linktype = atk_stream.get_datalink().unwrap_or(Linktype::ETHERNET);
+        let out_linktype = Linktype::ETHERNET;
         atk_stream.open_next()?;
         ben_stream.open_next()?;
 
-        // 2. 准备输出
         let cap_dead = Capture::dead(out_linktype)?;
-        let mut writer = cap_dead.savefile(output_path)?;
+        let mut pcap_writer = cap_dead.savefile(format!("{}_mixed.pcap", output_prefix_str))?;
+        let mut ds_writer = DatasetWriter::new(output_prefix_str)?;
 
-        // 3. 初始化当前包
-        let mut curr_atk = match atk_stream.next_packet() {
-            Some(p) => p,
+        let (mut curr_atk, mut curr_atk_lt) = match atk_stream.next_packet_with_linktype() {
+            Some((p, lt)) => (p, lt),
             None => {
                 warn!("⚠️ Attack pcap is empty.");
                 return Ok(0);
             },
         };
 
-        // 时间对齐：将背景流量对齐到攻击开始前的一点点
         let atk_start_ns = curr_atk.timestamp_ns();
         let cycle_base_ns = atk_start_ns.saturating_sub(ben_stream.duration_ns / 10);
-        let mut curr_ben = ben_stream.next_packet();
+        let mut curr_ben = ben_stream.next_packet_with_linktype();
 
         let mut rng = rand::thread_rng();
         let mut count = 0;
+        let mut ds_written = 0usize;
+        let mut ds_skipped = 0usize;
 
-        // 计算哈希阈值 (确定性采样)
-        let hash_threshold = (u64::MAX as f64 * self.sampling_rate) as u64;
+        let sampling_rate = self.sampling_rate.clamp(0.0, 1.0);
+        let hash_threshold = (u64::MAX as f64 * sampling_rate) as u64;
 
-        // 4. 归并循环
         loop {
-            // 计算背景包当前的虚拟时间戳
             let ben_ts = match &curr_ben {
-                Some(b) => {
+                Some((b, _lt)) => {
                     cycle_base_ns
                         + b.timestamp_ns().saturating_sub(ben_stream.base_start_ns)
                         + ben_stream.loop_offset_ns
@@ -92,51 +82,70 @@ impl MergeStrategy for HashSamplingStrategy {
             let atk_ts = curr_atk.timestamp_ns();
 
             if atk_ts <= ben_ts {
-                // Case A: 攻击包 (始终保留)
                 curr_atk.set_timestamp(atk_ts);
-                writer.write(&Packet {
-                    header: &curr_atk.header,
-                    data: &curr_atk.data,
-                });
+                write_pcap_and_dataset(
+                    &mut pcap_writer,
+                    &mut ds_writer,
+                    out_linktype,
+                    &curr_atk,
+                    curr_atk_lt,
+                    true,
+                    &mut ds_written,
+                    &mut ds_skipped,
+                )?;
                 count += 1;
-                match atk_stream.next_packet() {
-                    Some(p) => curr_atk = p,
+                match atk_stream.next_packet_with_linktype() {
+                    Some((p, lt)) => {
+                        curr_atk = p;
+                        curr_atk_lt = lt;
+                    },
                     None => break,
                 }
-            } else if let Some(mut b) = curr_ben {
-                // Case B: 背景包 (哈希采样)
-                let should_keep = if self.sampling_rate >= 1.0 {
+            } else if let Some((mut b, b_lt)) = curr_ben {
+                let should_keep = if sampling_rate >= 1.0 {
                     true
-                } else if let Some(key) = parse_packet_to_key(&b) {
+                } else if let Some(key) = parse_packet_to_key(&b, b_lt) {
                     key.canonical().get_hash() < hash_threshold
                 } else {
-                    rng.gen_bool(self.sampling_rate)
+                    rng.gen_bool(sampling_rate)
                 };
 
-                if should_keep {
-                    b.set_timestamp(ben_ts);
-                    writer.write(&Packet {
-                        header: &b.header,
-                        data: &b.data,
-                    });
-                    count += 1;
+                curr_ben = ben_stream.next_packet_with_linktype();
+
+                if !should_keep {
+                    continue;
                 }
-                curr_ben = ben_stream.next_packet();
+
+                b.set_timestamp(ben_ts);
+                write_pcap_and_dataset(
+                    &mut pcap_writer,
+                    &mut ds_writer,
+                    out_linktype,
+                    &b,
+                    b_lt,
+                    false,
+                    &mut ds_written,
+                    &mut ds_skipped,
+                )?;
+                count += 1;
             } else {
                 break;
             }
+        }
+        pcap_writer.flush()?;
+        ds_writer.flush()?;
+        if ds_written == 0 {
+            warn!("⚠️ Dataset export produced 0 rows (skipped {}).", ds_skipped);
+        } else {
+            info!("   ✅ Dataset rows written: {} (skipped: {})", ds_written, ds_skipped);
         }
         Ok(count)
     }
 }
 
-// =============================================================================
-// 3. 策略二：基于预算的流规划 (Budget Control Mode)
-// =============================================================================
-
 pub struct BudgetControlStrategy {
-    attack_pattern: String,
-    benign_pattern: String,
+    attack_str: String,
+    benign_str: String,
     total_pkts: u64,
     attack_ratio: f64,
     time_bins: usize,
@@ -145,16 +154,16 @@ pub struct BudgetControlStrategy {
 
 impl BudgetControlStrategy {
     pub fn new(
-        attack_pattern: &str,
-        benign_pattern: &str,
+        attack_str: &str,
+        benign_str: &str,
         total_pkts: u64,
         attack_ratio: f64,
         time_bins: usize,
         bidirectional: bool,
     ) -> Self {
         Self {
-            attack_pattern: attack_pattern.to_string(),
-            benign_pattern: benign_pattern.to_string(),
+            attack_str: attack_str.to_string(),
+            benign_str: benign_str.to_string(),
             total_pkts,
             attack_ratio,
             time_bins,
@@ -164,49 +173,47 @@ impl BudgetControlStrategy {
 }
 
 impl MergeStrategy for BudgetControlStrategy {
-    fn execute(&self, output_path: &str) -> Result<usize> {
+    fn execute(&self, output_prefix_str: &str) -> Result<usize> {
         info!(
             "🚀 Running Merge: Budget Control Mode (Total: {}, Attack Ratio: {:.2})",
             self.total_pkts, self.attack_ratio
         );
 
-        // 1. 预算计算
         let r_atk = self.attack_ratio.clamp(0.0, 1.0);
         let b_atk = ((self.total_pkts as f64) * r_atk).floor() as u64;
         let b_ben = self.total_pkts.saturating_sub(b_atk);
 
-        // 2. 扫描统计 (Pass 1)
         info!("   -> Scanning flow stats...");
-        let (atk_stats, atk_min, atk_max) = scan_flow_stats(&self.attack_pattern, self.bidirectional)?;
-        let (ben_stats, ben_min, ben_max) = scan_flow_stats(&self.benign_pattern, self.bidirectional)?;
+        let (atk_stats, atk_min, atk_max) = scan_flow_stats(&self.attack_str, self.bidirectional)?;
+        let (ben_stats, ben_min, ben_max) = scan_flow_stats(&self.benign_str, self.bidirectional)?;
 
         let min_ts = atk_min.min(ben_min);
         let max_ts = atk_max.max(ben_max);
 
-        // 3. 流选择规划
         info!("   -> Selecting flows...");
         let selected_atk = select_flows_by_budget(&atk_stats, min_ts, max_ts, b_atk, self.time_bins, true);
         let selected_ben = select_flows_by_budget(&ben_stats, min_ts, max_ts, b_ben, self.time_bins, false);
 
-        // 4. 重放合并 (Pass 2)
-        let mut atk_stream = PcapStreamer::new(&self.attack_pattern, false)?;
-        let mut ben_stream = PcapStreamer::new(&self.benign_pattern, true)?;
+        let mut atk_stream = PcapStreamer::new(&self.attack_str, false)?;
+        let mut ben_stream = PcapStreamer::new(&self.benign_str, true)?;
         ben_stream.scan_duration()?;
 
-        let out_linktype = atk_stream.get_datalink().unwrap_or(Linktype::ETHERNET);
+        let out_linktype = Linktype::ETHERNET;
         atk_stream.open_next()?;
         ben_stream.open_next()?;
 
         let cap_dead = Capture::dead(out_linktype)?;
-        let mut writer = cap_dead.savefile(output_path)?;
+        let mut pcap_writer = cap_dead.savefile(format!("{}_mixed.pcap", output_prefix_str))?;
+        let mut ds_writer = DatasetWriter::new(output_prefix_str)?;
+        let mut ds_written = 0usize;
+        let mut ds_skipped = 0usize;
 
         let mut atk_budget_left = b_atk;
         let mut ben_budget_left = b_ben;
 
-        // 初始化第一个选中的包
-        let mut curr_atk =
+        let (mut curr_atk, mut curr_atk_lt) =
             match next_selected_packet(&mut atk_stream, &selected_atk, self.bidirectional, &mut atk_budget_left) {
-                Some(p) => p,
+                Some((p, lt)) => (p, lt),
                 None => {
                     warn!("⚠️ Attack budget selection resulted in empty stream.");
                     return Ok(0);
@@ -218,11 +225,9 @@ impl MergeStrategy for BudgetControlStrategy {
             next_selected_packet(&mut ben_stream, &selected_ben, self.bidirectional, &mut ben_budget_left);
 
         let mut count = 0;
-
-        // 归并循环 (Budget Mode)
         loop {
             let ben_ts = match &curr_ben {
-                Some(b) => {
+                Some((b, _lt)) => {
                     cycle_base_ns
                         + b.timestamp_ns().saturating_sub(ben_stream.base_start_ns)
                         + ben_stream.loop_offset_ns
@@ -233,21 +238,36 @@ impl MergeStrategy for BudgetControlStrategy {
 
             if atk_ts <= ben_ts {
                 curr_atk.set_timestamp(atk_ts);
-                writer.write(&Packet {
-                    header: &curr_atk.header,
-                    data: &curr_atk.data,
-                });
+                write_pcap_and_dataset(
+                    &mut pcap_writer,
+                    &mut ds_writer,
+                    out_linktype,
+                    &curr_atk,
+                    curr_atk_lt,
+                    true,
+                    &mut ds_written,
+                    &mut ds_skipped,
+                )?;
                 count += 1;
                 match next_selected_packet(&mut atk_stream, &selected_atk, self.bidirectional, &mut atk_budget_left) {
-                    Some(p) => curr_atk = p,
-                    None => break, // 攻击流用完或预算耗尽
+                    Some((p, lt)) => {
+                        curr_atk = p;
+                        curr_atk_lt = lt;
+                    },
+                    None => break,
                 }
-            } else if let Some(mut b) = curr_ben {
+            } else if let Some((mut b, b_lt)) = curr_ben {
                 b.set_timestamp(ben_ts);
-                writer.write(&Packet {
-                    header: &b.header,
-                    data: &b.data,
-                });
+                write_pcap_and_dataset(
+                    &mut pcap_writer,
+                    &mut ds_writer,
+                    out_linktype,
+                    &b,
+                    b_lt,
+                    false,
+                    &mut ds_written,
+                    &mut ds_skipped,
+                )?;
                 count += 1;
                 curr_ben =
                     next_selected_packet(&mut ben_stream, &selected_ben, self.bidirectional, &mut ben_budget_left);
@@ -256,30 +276,18 @@ impl MergeStrategy for BudgetControlStrategy {
             }
         }
 
-        // 补齐背景流量 (可选)
-        while let Some(mut b) = curr_ben {
-            let ben_ts =
-                cycle_base_ns + b.timestamp_ns().saturating_sub(ben_stream.base_start_ns) + ben_stream.loop_offset_ns;
-            b.set_timestamp(ben_ts);
-            writer.write(&Packet {
-                header: &b.header,
-                data: &b.data,
-            });
-            count += 1;
-            curr_ben = next_selected_packet(&mut ben_stream, &selected_ben, self.bidirectional, &mut ben_budget_left);
+        pcap_writer.flush()?;
+        ds_writer.flush()?;
+        if ds_written == 0 {
+            warn!("⚠️ Dataset export produced 0 rows (skipped {}).", ds_skipped);
+        } else {
+            info!("   ✅ Dataset rows written: {} (skipped: {})", ds_written, ds_skipped);
         }
-
         Ok(count)
     }
 }
 
-// =============================================================================
-// 4. 工厂入口 / 主函数
-// =============================================================================
-
-/// 对外暴露的统一入口
-pub fn merge_pcap(attack_pattern: &str, benign_pattern: &str, output: &str, sampling_rate: f64) -> Result<usize> {
-    // 环境变量读取
+pub fn merge_pcap(attack_str: &str, benign_str: &str, output_prefix_str: &str, sampling_rate: f64) -> Result<usize> {
     let controlled_total_pkts = env::var("PCAP_MERGE_TOTAL_PKTS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
@@ -287,7 +295,6 @@ pub fn merge_pcap(attack_pattern: &str, benign_pattern: &str, output: &str, samp
         .ok()
         .and_then(|v| v.parse::<f64>().ok());
 
-    // 策略选择工厂逻辑
     let strategy: Box<dyn MergeStrategy> =
         if let (Some(total), Some(ratio)) = (controlled_total_pkts, controlled_attack_ratio) {
             let bins = env::var("PCAP_MERGE_TIME_BINS")
@@ -300,26 +307,15 @@ pub fn merge_pcap(attack_pattern: &str, benign_pattern: &str, output: &str, samp
                 .unwrap_or(false);
 
             Box::new(BudgetControlStrategy::new(
-                attack_pattern,
-                benign_pattern,
-                total,
-                ratio,
-                bins,
-                bidir,
+                attack_str, benign_str, total, ratio, bins, bidir,
             ))
         } else {
-            Box::new(HashSamplingStrategy::new(attack_pattern, benign_pattern, sampling_rate))
+            Box::new(HashSamplingStrategy::new(attack_str, benign_str, sampling_rate))
         };
 
-    // 执行策略
-    strategy.execute(output)
+    strategy.execute(output_prefix_str)
 }
 
-// =============================================================================
-// 5. 基础设施 & 辅助函数
-// =============================================================================
-
-// OwnedPacket: 用于在内存中持有数据包所有权的结构体
 #[derive(Clone)]
 struct OwnedPacket {
     header: PacketHeader,
@@ -333,6 +329,12 @@ impl OwnedPacket {
             data: packet.data.to_vec(),
         }
     }
+    fn as_pcap_packet(&self) -> Packet<'_> {
+        Packet {
+            header: &self.header,
+            data: &self.data,
+        }
+    }
     fn timestamp_ns(&self) -> u64 {
         (self.header.ts.tv_sec as u64) * 1_000_000_000 + (self.header.ts.tv_usec as u64) * 1_000
     }
@@ -342,7 +344,37 @@ impl OwnedPacket {
     }
 }
 
-// PcapStreamer: 处理多文件读取和循环播放
+fn wrap_owned_to_ethernet(op: &OwnedPacket, link_type: Linktype) -> Option<OwnedPacket> {
+    let pkt_ref = op.as_pcap_packet();
+    let (hdr, data) = crate::parser::wrap_to_ethernet(&pkt_ref, link_type)?;
+    Some(OwnedPacket { header: hdr, data })
+}
+
+fn write_pcap_and_dataset(
+    pcap_writer: &mut pcap::Savefile,
+    ds_writer: &mut DatasetWriter,
+    out_linktype: Linktype,
+    op: &OwnedPacket,
+    op_lt: Linktype,
+    is_pos: bool,
+    ds_written: &mut usize,
+    ds_skipped: &mut usize,
+) -> Result<()> {
+    if let Some(wp) = wrap_owned_to_ethernet(op, op_lt) {
+        let pkt_ref = wp.as_pcap_packet();
+        pcap_writer.write(&pkt_ref);
+        if let Some(meta) = crate::parser::parse_packet(&pkt_ref, out_linktype) {
+            ds_writer.write_from_meta(&meta, is_pos)?;
+            *ds_written += 1;
+        } else {
+            *ds_skipped += 1;
+        }
+    } else {
+        *ds_skipped += 1;
+    }
+    Ok(())
+}
+
 struct PcapStreamer {
     files: Vec<PathBuf>,
     current_file_idx: usize,
@@ -351,6 +383,7 @@ struct PcapStreamer {
     duration_ns: u64,
     loop_offset_ns: u64,
     base_start_ns: u64,
+    current_linktype: Option<Linktype>,
 }
 
 impl PcapStreamer {
@@ -376,6 +409,7 @@ impl PcapStreamer {
             duration_ns: 0,
             loop_offset_ns: 0,
             base_start_ns: 0,
+            current_linktype: None,
         })
     }
 
@@ -406,74 +440,94 @@ impl PcapStreamer {
                 return Ok(false);
             }
         }
-        self.capture = Some(Capture::from_file(&self.files[self.current_file_idx])?);
+        let cap = Capture::from_file(&self.files[self.current_file_idx])?;
+        self.current_linktype = Some(cap.get_datalink());
+        self.capture = Some(cap);
         self.current_file_idx += 1;
         Ok(true)
     }
 
-    fn next_packet(&mut self) -> Option<OwnedPacket> {
+    fn next_packet_with_linktype(&mut self) -> Option<(OwnedPacket, Linktype)> {
         loop {
             if self.capture.is_none() {
                 if !self.open_next().unwrap_or(false) {
                     return None;
                 }
             }
+            let lt = self.current_linktype.unwrap_or(Linktype::ETHERNET);
             match self.capture.as_mut().unwrap().next_packet() {
-                Ok(pkt) => {
-                    return Some(OwnedPacket::from_pcap(&pkt));
-                },
+                Ok(pkt) => return Some((OwnedPacket::from_pcap(&pkt), lt)),
                 Err(pcap::Error::NoMorePackets) => {
                     self.capture = None;
+                    self.current_linktype = None;
                     continue;
                 },
                 _ => return None,
             }
         }
     }
-
-    fn get_datalink(&self) -> Result<Linktype> {
-        if self.files.is_empty() {
-            anyhow::bail!("No files to check linktype");
-        }
-        let cap = Capture::from_file(&self.files[0])?;
-        Ok(cap.get_datalink())
-    }
 }
 
-// ... 辅助函数 parse_packet_to_key (必须适配 common::FlowKey) ...
-fn parse_packet_to_key(pkt: &OwnedPacket) -> Option<FlowKey> {
+fn parse_packet_to_key(pkt: &OwnedPacket, link_type: Linktype) -> Option<FlowKey> {
     let data = &pkt.data;
-    if data.len() < 14 {
+    if data.is_empty() {
         return None;
     }
 
-    // 简单解析 Ethernet Header
-    let ethertype = u16::from_be_bytes([data[12], data[13]]);
+    // Determine L3 offset and ethertype/proto
+    let (l3_offset, ethertype) = match link_type {
+        Linktype::ETHERNET => {
+            if data.len() < 14 {
+                return None;
+            }
+            let et = u16::from_be_bytes([data[12], data[13]]);
+            if et == 0x8100 {
+                if data.len() < 18 {
+                    return None;
+                }
+                let et2 = u16::from_be_bytes([data[16], data[17]]);
+                (18usize, et2)
+            } else {
+                (14usize, et)
+            }
+        },
+        Linktype(113) => {
+            if data.len() < 16 {
+                return None;
+            }
+            let et = u16::from_be_bytes([data[14], data[15]]);
+            (16usize, et)
+        },
+        Linktype(12) => {
+            let ver = data[0] >> 4;
+            let et = match ver {
+                4 => 0x0800,
+                6 => 0x86DD,
+                _ => return None,
+            };
+            (0usize, et)
+        },
+        _ => return None,
+    };
 
     match ethertype {
         0x0800 => {
             // IPv4
-            if data.len() < 34 {
-                return None;
-            } // 14(Eth) + 20(IP)
-            let ip = &data[14..];
-            let ver_ihl = ip[0];
-            let ver = ver_ihl >> 4;
-            if ver != 4 {
+            if data.len() < l3_offset + 20 {
                 return None;
             }
-            let ihl = (ver_ihl & 0x0F) as usize * 4;
+            let ip = &data[l3_offset..];
+            if (ip[0] >> 4) != 4 {
+                return None;
+            }
+            let ihl = (ip[0] & 0x0F) as usize * 4;
             if ip.len() < ihl + 4 {
                 return None;
-            } // IP header + 4 bytes for ports
-
+            }
             let proto = ip[9];
-
-            // 提取 IP 地址
             let src_ip = IpAddr::V4(Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]));
             let dst_ip = IpAddr::V4(Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]));
 
-            // 提取端口 (仅针对 TCP/UDP)
             let mut sport = 0u16;
             let mut dport = 0u16;
             if proto == 6 || proto == 17 {
@@ -483,46 +537,38 @@ fn parse_packet_to_key(pkt: &OwnedPacket) -> Option<FlowKey> {
                     dport = u16::from_be_bytes([l4[2], l4[3]]);
                 }
             }
-
-            // 使用 common::FlowKey::new
             Some(FlowKey::new(src_ip, dst_ip, sport, dport, proto))
         },
         0x86DD => {
             // IPv6
-            if data.len() < 54 {
-                return None;
-            } // 14(Eth) + 40(IP)
-            let ip = &data[14..];
-            let ver = ip[0] >> 4;
-            if ver != 6 {
+            if data.len() < l3_offset + 40 {
                 return None;
             }
+            let ip = &data[l3_offset..];
+            if (ip[0] >> 4) != 6 {
+                return None;
+            }
+            let proto = ip[6];
 
-            let proto = ip[6]; // Next Header
-
-            // 提取 IPv6 地址 (需要拷贝字节数组)
             let mut src_bytes = [0u8; 16];
             let mut dst_bytes = [0u8; 16];
             src_bytes.copy_from_slice(&ip[8..24]);
             dst_bytes.copy_from_slice(&ip[24..40]);
-
             let src_ip = IpAddr::V6(Ipv6Addr::from(src_bytes));
             let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_bytes));
 
             let mut sport = 0u16;
             let mut dport = 0u16;
             if proto == 6 || proto == 17 {
-                // 简化处理：假设没有 IPv6 Extension Headers
                 let l4 = &ip[40..];
                 if l4.len() >= 4 {
                     sport = u16::from_be_bytes([l4[0], l4[1]]);
                     dport = u16::from_be_bytes([l4[2], l4[3]]);
                 }
             }
-
             Some(FlowKey::new(src_ip, dst_ip, sport, dport, proto))
         },
-        _ => None, // 非 IP 流量 (ARP, etc.)
+        _ => None,
     }
 }
 
@@ -558,6 +604,7 @@ fn scan_flow_stats(pattern: &str, bidir: bool) -> Result<(HashMap<FlowKey, FlowS
 
     for f in files {
         let mut cap = Capture::from_file(&f)?;
+        let lt = cap.get_datalink();
         while let Ok(pkt) = cap.next_packet() {
             let op = OwnedPacket::from_pcap(&pkt);
             let ts = op.timestamp_ns();
@@ -568,7 +615,7 @@ fn scan_flow_stats(pattern: &str, bidir: bool) -> Result<(HashMap<FlowKey, FlowS
                 max_ts = ts;
             }
 
-            if let Some(mut k) = parse_packet_to_key(&op) {
+            if let Some(mut k) = parse_packet_to_key(&op, lt) {
                 if bidir {
                     k = k.canonical();
                 }
@@ -687,19 +734,18 @@ fn next_selected_packet(
     selected: &HashSet<FlowKey>,
     bidir: bool,
     remaining_budget: &mut u64,
-) -> Option<OwnedPacket> {
+) -> Option<(OwnedPacket, Linktype)> {
     while *remaining_budget > 0 {
-        let pkt = stream.next_packet()?;
-        if let Some(mut k) = parse_packet_to_key(&pkt) {
+        let (pkt, lt) = stream.next_packet_with_linktype()?;
+        if let Some(mut k) = parse_packet_to_key(&pkt, lt) {
             if bidir {
                 k = k.canonical();
             }
             if selected.contains(&k) {
                 *remaining_budget = remaining_budget.saturating_sub(1);
-                return Some(pkt);
+                return Some((pkt, lt));
             }
         }
-        // not selected => skip
     }
     None
 }

@@ -1,0 +1,10 @@
+{
+    "global": {
+        "mode": "folder",
+        "pos_glob": "data/raw/ISCX-VPN-NonVPN-2016/PCAPs/VPN-PCAPS-01/vpn_aim_chat1a.pcap",
+        "neg_glob": "data/raw/ISCX-VPN-NonVPN-2016/PCAPs/NonVPN-PCAPs-01/aim_chat_3a.pcap",
+        "output_dir": "./data/experiments/ISCX-VPN-NonVPN-2016",
+        "neg_sampling_rate": 1.0
+    },
+    "attacks": []
+}

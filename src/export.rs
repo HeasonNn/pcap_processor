@@ -1,20 +1,61 @@
-use crate::common::FlowFeature;
+use crate::common::{FlowFeature,PacketMeta};
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io::{BufWriter, Write}; // 引用 common
+use std::io::{BufWriter, Write};
+
+pub struct DatasetWriter {
+    data_w: BufWriter<File>,
+    label_w: BufWriter<File>,
+    align_ts_ns: Option<i64>,
+}
+
+impl DatasetWriter {
+    pub fn new(output_perfix_str: &str) -> Result<Self> {
+        Ok(Self {
+            data_w: BufWriter::new(File::create(format!("{}.data", output_perfix_str))?),
+            label_w: BufWriter::new(File::create(format!("{}.label", output_perfix_str))?),
+            align_ts_ns: None,
+        })
+    }
+
+    #[inline]
+    pub fn write_from_meta(&mut self, meta: &PacketMeta, is_pos: bool) -> Result<()> {
+        let align = *self.align_ts_ns.get_or_insert(meta.ts_ns);
+        let rel_ts = meta.ts_ns - align;
+
+        writeln!(
+            self.data_w,
+            "{} {} {} {} {} {} {} {}",
+            if meta.src_ip.is_ipv4() { 4 } else { 6 },
+            meta.src_ip,
+            meta.dst_ip,
+            meta.src_port,
+            meta.dst_port,
+            rel_ts,
+            meta.packet_code,
+            meta.ip_len
+        )?;
+        self.label_w.write_all(if is_pos { b"1" } else { b"0" })?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.data_w.flush()?;
+        self.label_w.flush()?;
+        Ok(())
+    }
+}
 
 pub struct CsvExporter {
     writer: BufWriter<File>,
 }
 
 impl CsvExporter {
-    /// 创建 Exporter 并写入表头
     pub fn new(output_path: &str) -> Result<Self> {
         let file =
             File::create(output_path).with_context(|| format!("Failed to create output CSV: {}", output_path))?;
         let mut writer = BufWriter::new(file);
 
-        // 写入表头
         writeln!(
             writer,
             "src_ip,src_port,dst_ip,dst_port,protocol,timestamp,byteps,pps,duration,\
@@ -25,12 +66,9 @@ impl CsvExporter {
         Ok(Self { writer })
     }
 
-    /// 写入单条记录
     pub fn write_record(&mut self, f: &FlowFeature) -> Result<()> {
         let seconds = f.start_ts / 1_000_000_000;
         let nanoseconds = (f.start_ts % 1_000_000_000) as u32;
-
-        // 使用 chrono 进行时间格式化 (需确保 Cargo.toml 有 chrono)
         let dt = chrono::DateTime::from_timestamp(seconds, nanoseconds).unwrap_or_default();
         let ts_str = dt.format("%m/%d/%Y %H:%M:%S").to_string();
 
@@ -61,7 +99,6 @@ impl CsvExporter {
         Ok(())
     }
 
-    /// 显式刷新缓冲区 (可选，Drop 时也会自动刷新)
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())

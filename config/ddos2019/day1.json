@@ -1,7 +1,9 @@
 {
     "global": {
+        "mode": "rules",
         "raw_pcap": "data/raw/CICDDoS2019/PCAPs/03-11",
-        "workspace_dir": "data/experiments/CICDDoS2019_Day1/"
+        "output_dir": "data/experiments/CICDDoS2019_Day1/",
+        "neg_sampling_rate": 1.0
     },
     "attacks": [
         {

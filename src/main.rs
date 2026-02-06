@@ -7,6 +7,7 @@ mod parser;
 use crate::common::{Args, Config};
 use anyhow::{Context, Result};
 use clap::Parser;
+use glob::glob;
 use log::{error, info, warn};
 use std::fs::File;
 use std::io::BufReader;
@@ -20,11 +21,43 @@ fn ensure_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn run_one_scenario(
+    workspace: &str,
+    scenario_name: &str,
+    pos_pcap: &str,
+    neg_pcap: &str,
+    sampling_rate: f64,
+) -> Result<()> {
+    let dataset_prefix = Path::new(workspace).join(scenario_name);
+    let mixed_pcap_path = format!("{}_mixed.pcap", dataset_prefix.to_string_lossy());
+    info!("   Merge+Export: {} + NEG (Sampled) -> {}", pos_pcap, mixed_pcap_path);
+
+    let prefix_str = dataset_prefix.to_string_lossy().to_string();
+    match merger::merge_pcap(pos_pcap, neg_pcap, &prefix_str, sampling_rate) {
+        Ok(count) => {
+            info!("   ✅ Merge+Export success. Total packets: {}", count);
+
+            let data_file = format!("{}.data", prefix_str);
+            let label_file = format!("{}.label", prefix_str);
+            let csv_path = format!("{}.csv", prefix_str);
+            info!("   Flow: Constructing flows -> {}", csv_path);
+
+            let engine = flow::FlowEngine::new(5_000_000);
+            match engine.run(&data_file, &label_file, &csv_path) {
+                Ok(_) => info!("   ✅ Flow CSV generated: {}", scenario_name),
+                Err(e) => error!("   ❌ Flow Construction failed: {}", e),
+            }
+        },
+        Err(e) => error!("   ❌ Merge+Export failed: {}", e),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = Args::parse();
 
-    // 1. 加载配置与预检
+    // 1. Load config
     let config_path = Path::new(&args.config);
     if !config_path.exists() {
         anyhow::bail!("Config file not found: {}", args.config);
@@ -33,100 +66,126 @@ fn main() -> Result<()> {
     let reader = BufReader::new(file);
     let config: Config = serde_json::from_reader(reader).context("Failed to parse config JSON")?;
 
-    let workspace = &config.global.workspace_dir;
-    let raw_pcap = &config.global.raw_pcap;
-    let sampling_rate = config.global.benign_sampling_rate;
+    let workspace = &config.global.output_dir;
+    let mode = &config.global.mode;
+    let sampling_rate = config.global.neg_sampling_rate;
 
     ensure_dir(workspace)?;
-    if !Path::new(raw_pcap).exists() {
-        anyhow::bail!("Raw PCAP source does not exist: {}", raw_pcap);
-    }
 
-    // 收集所有规则
-    let mut all_rules = Vec::new();
-    for attack in &config.attacks {
-        all_rules.extend(attack.rules.clone());
-    }
-
-    info!("🚀 Pipeline started. Workspace: {}", workspace);
-    info!("🎲 Benign Sampling Rate: {:.2}%", sampling_rate * 100.0);
-
-    // Step 1: Filter (分离流量)
-    info!("Step 1: Filtering Raw PCAP...");
-    let generated_files = parser::filter_malicious_pkt(raw_pcap, &all_rules, workspace)?;
-
-    let benign_pcap_path = Path::new(workspace).join("BENIGN.pcap");
-    if !benign_pcap_path.exists() {
-        warn!("⚠️ BENIGN.pcap was not created. Merging might fail if background traffic is required.");
-    }
-
-    // Step 2, 3 & 4: Loop Scenarios
-    for (idx, attack) in config.attacks.iter().enumerate() {
-        info!("------------------------------------------------");
-        info!(">>> [{}/{}] Scenario: {}", idx + 1, config.attacks.len(), attack.name);
-
-        if attack.rules.is_empty() {
-            warn!("   Skipping scenario '{}' (No rules defined)", attack.name);
-            continue;
+    if mode == "rules" {
+        let raw_pcap = config
+            .global
+            .raw_pcap
+            .as_ref()
+            .context("raw_pcap is required in rules mode")?;
+        if !Path::new(raw_pcap).exists() {
+            anyhow::bail!("Raw PCAP source does not exist: {}", raw_pcap);
         }
 
-        let attack_type = &attack.rules[0].attack_type;
-        let attack_fragment_path: PathBuf = match generated_files.get(attack_type) {
-            Some(path) => PathBuf::from(path),
-            None => {
-                let fallback = Path::new(workspace).join(format!("{}.pcap", attack_type));
-                if fallback.exists() {
-                    fallback
-                } else {
-                    warn!("❌ Attack file for type '{}' not found. Skipping.", attack_type);
-                    continue;
-                }
-            },
-        };
+        // Collect all rules
+        let mut all_rules = Vec::new();
+        for s in &config.attacks {
+            all_rules.extend(s.rules.clone());
+        }
 
-        let mixed_pcap_path = Path::new(workspace).join(format!("{}_mixed.pcap", attack.name));
-        let dataset_prefix = Path::new(workspace).join(&attack.name);
+        info!("🚀 Pipeline started. Workspace: {}", workspace);
+        info!("🎲 NEG Sampling Rate: {:.2}%", sampling_rate * 100.0);
 
-        // Step 2: Merge
-        info!(
-            "   Merge: {} + BENIGN (Sampled) -> {}",
-            attack_type,
-            mixed_pcap_path.display()
-        );
-        let atk_str = attack_fragment_path.to_str().unwrap();
-        let ben_str = benign_pcap_path.to_str().unwrap();
-        let mix_str = mixed_pcap_path.to_str().unwrap();
+        // Step 1: Filter (split)
+        info!("Step 1: Filtering Raw PCAP...");
+        let generated_files = parser::filter_malicious_pkt(raw_pcap, &all_rules, workspace)?;
 
-        match merger::merge_pcap(atk_str, ben_str, mix_str, sampling_rate) {
-            Ok(count) => {
-                info!("   ✅ Merge success. Total packets: {}", count);
+        let neg_pcap_path = Path::new(workspace).join("BENIGN.pcap");
+        if !neg_pcap_path.exists() {
+            warn!("⚠️ BENIGN.pcap was not created. Merging might fail if background traffic is required.");
+        }
 
-                // Step 3: Parse & Label (生成 .data 和 .label)
-                info!("   Labeling: Generating dataset...");
-                let prefix_str = dataset_prefix.to_str().unwrap();
-                let data_file = format!("{}.data", prefix_str);
-                let label_file = format!("{}.label", prefix_str);
+        // Step 2/3/4: per-scenario
+        for (idx, attack) in config.attacks.iter().enumerate() {
+            info!("------------------------------------------------");
+            info!(">>> [{}/{}] Scenario: {}", idx + 1, config.attacks.len(), attack.name);
 
-                if let Err(e) = parser::process_and_write(mix_str, prefix_str, &attack.rules) {
-                    error!("   ❌ Parse/Label failed: {}\nCaused by: {:?}", e, e.source());
-                } else {
-                    info!("   ✅ Dataset generated: .data / .label");
+            if attack.rules.is_empty() {
+                warn!("   Skipping scenario '{}' (No rules defined)", attack.name);
+                continue;
+            }
 
-                    // Step 4: Flow Construction (生成 .csv)
-                    let csv_path = format!("{}.csv", prefix_str);
-                    info!("   Flow: Constructing flows -> {}", csv_path);
-
-                    let engine = flow::FlowEngine::new(5_000_000);
-                    match engine.run(&data_file, &label_file, &csv_path) {
-                        Ok(_) => info!("   ✅ Flow CSV generated: {}", attack.name),
-                        Err(e) => error!("   ❌ Flow Construction failed: {}", e),
+            let attack_type = &attack.rules[0].attack_type;
+            let pos_fragment_path: PathBuf = match generated_files.get(attack_type) {
+                Some(path) => PathBuf::from(path),
+                None => {
+                    let fallback = Path::new(workspace).join(format!("{}.pcap", attack_type));
+                    if fallback.exists() {
+                        fallback
+                    } else {
+                        warn!("❌ POS file for type '{}' not found. Skipping.", attack_type);
+                        continue;
                     }
-                }
-            },
-            Err(e) => error!("   ❌ Replay/Merge failed: {}", e),
-        }
-    }
+                },
+            };
 
-    info!("🎉 Pipeline completed successfully.");
-    Ok(())
+            let pos_str = pos_fragment_path.to_string_lossy().to_string();
+            let neg_str = neg_pcap_path.to_string_lossy().to_string();
+
+            run_one_scenario(workspace, &attack.name, &pos_str, &neg_str, sampling_rate)?;
+        }
+
+        info!("🎉 Pipeline completed successfully.");
+        Ok(())
+    } else if mode == "folder" {
+        let pos_path_str = config
+            .global
+            .pos_glob
+            .as_ref()
+            .context("pos_glob is required in folder mode")?;
+        let neg_path_str = config
+            .global
+            .neg_glob
+            .as_ref()
+            .context("neg_glob is required in folder mode")?;
+
+        // Collect POS pcaps via glob
+        let mut pos_files: Vec<PathBuf> = Vec::new();
+        for entry in glob(pos_path_str).context("Invalid pos_glob pattern")? {
+            if let Ok(p) = entry {
+                if p.extension().and_then(|s| s.to_str()) == Some("pcap") {
+                    pos_files.push(p);
+                }
+            }
+        }
+        pos_files.sort_by(|a, b| natord::compare(&a.to_string_lossy(), &b.to_string_lossy()));
+        if pos_files.is_empty() {
+            anyhow::bail!("No POS pcap files matched: {}", pos_path_str);
+        }
+
+        // Prepare NEG pcap into workspace/BENIGN.pcap (existing helper)
+        let neg_file_str = parser::compact_neg_pkt(neg_path_str, workspace).context("Failed to compact NEG pcaps")?;
+        let neg_file_path = Path::new(&neg_file_str);
+        if !neg_file_path.exists() {
+            anyhow::bail!("NEG pcap not found after compacting: {}", neg_file_path.display());
+        }
+
+        info!("🚀 Folder-mode Pipeline started. Workspace: {}", workspace);
+        info!("🎲 NEG Sampling Rate: {:.2}%", sampling_rate * 100.0);
+        info!("   POS files: {}", pos_files.len());
+        info!("   NEG file: {}", neg_file_path.display());
+
+        for (idx, pos_file) in pos_files.iter().enumerate() {
+            let scenario = pos_file.file_stem().and_then(|s| s.to_str()).unwrap_or("pos");
+
+            info!("------------------------------------------------");
+            info!(">>> [{}/{}] Scenario: {}", idx + 1, pos_files.len(), scenario);
+
+            let pos_str = pos_file.to_string_lossy().to_string();
+            let neg_str = neg_file_path.to_string_lossy().to_string();
+
+            run_one_scenario(workspace, scenario, &pos_str, &neg_str, sampling_rate)?;
+        }
+
+        info!("🎉 Pipeline completed successfully.");
+        Ok(())
+    } else {
+        warn!("Unknown mode: {}", mode);
+        Ok(())
+    }
 }

@@ -6,8 +6,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::common::{FlowFeature, FlowKey, RawPacket}; // 引用公共定义
-use crate::export::CsvExporter; // 引用导出模块
+use crate::common::{FlowFeature, FlowKey, RawPacket};
+use crate::export::CsvExporter;
 
 const FLOW_TIMEOUT_NS: i64 = 120 * 1_000_000_000;
 
@@ -26,8 +26,6 @@ impl FlowEngine {
 
         let mut reader_data = BufReader::new(file_data);
         let mut reader_label = BufReader::new(file_label);
-
-        // 【变化点】初始化 Exporter
         let mut exporter = CsvExporter::new(output_csv)?;
 
         let mut batch_idx = 0;
@@ -40,7 +38,6 @@ impl FlowEngine {
             lines_data.clear();
             buf_label.clear();
 
-            // 1. 读取 Batch (逻辑保持不变)
             let mut line = String::new();
             while lines_data.len() < self.batch_size {
                 line.clear();
@@ -69,20 +66,17 @@ impl FlowEngine {
             let valid_len = std::cmp::min(lines_data.len(), buf_label.len());
             log::info!("🔄 Processing Batch {}: {} packets...", batch_idx, valid_len);
 
-            // 2. 并行解析
             let packets: Vec<RawPacket> = lines_data[..valid_len]
                 .par_iter()
                 .zip(&buf_label[..valid_len])
                 .filter_map(|(line, &label)| parse_line(line, label))
                 .collect();
 
-            // 3. 分片 (Sharding)
             let num_shards = rayon::current_num_threads();
             let mut shards: Vec<Vec<RawPacket>> = vec![Vec::new(); num_shards];
 
             for pkt in packets {
                 let proto_u8 = decode_proto(pkt.proto_code);
-                // 使用 canonical 保证分片一致性 (双向流去同一个分片)
                 let key = FlowKey::new(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port, proto_u8).canonical();
 
                 let hash = key.get_hash();
@@ -90,11 +84,9 @@ impl FlowEngine {
                 shards[shard_idx].push(pkt);
             }
 
-            // 4. 并行重组与特征提取
             let batch_features: Vec<FlowFeature> =
                 shards.into_par_iter().flat_map(|shard| process_shard(shard)).collect();
 
-            // 5. 写入 CSV (调用 Exporter)
             for f in &batch_features {
                 exporter.write_record(f)?;
             }
@@ -108,10 +100,6 @@ impl FlowEngine {
         Ok(())
     }
 }
-
-// -----------------------------------------------------------------------------
-// 内部辅助逻辑 (Accumulator 等)
-// -----------------------------------------------------------------------------
 
 fn parse_line(line: &str, label: bool) -> Option<RawPacket> {
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -137,7 +125,6 @@ fn process_shard(packets: Vec<RawPacket>) -> Vec<FlowFeature> {
 
     for pkt in packets {
         let proto_u8 = decode_proto(pkt.proto_code);
-        // 特征提取时，我们通常保留原始方向 (不使用 canonical)
         let key = FlowKey::new(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port, proto_u8);
 
         let mut evicted = None;
@@ -267,15 +254,12 @@ fn decode_proto(code: u16) -> u8 {
     if (code & (0xF0)) != 0 {
         6
     }
-    // TCP flags usually in upper byte mixed
     else if (code & (1 << 8)) != 0 {
         17
     }
-    // UDP
     else if (code & (1 << 2)) != 0 {
         1
     }
-    // ICMP
     else {
         0
     }
