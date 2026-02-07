@@ -309,7 +309,6 @@ pub fn compact_neg_pkt(neg_pcap_path: &str, output_dir: &str) -> Result<String> 
     }
 
     let mut count: u64 = 0;
-
     while let Some(Reverse(entry)) = heap.pop() {
         let idx = entry.file_idx;
         let pkt_ref = Packet {
