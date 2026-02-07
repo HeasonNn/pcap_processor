@@ -5,6 +5,7 @@ mod merger;
 mod parser;
 
 use crate::common::{Args, Config};
+use crate::parser::compact_pcap;
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info, warn};
@@ -36,8 +37,7 @@ fn run_one_scenario(
 
     info!(
         "   Merge+Export: {} + NEG (Sampled) -> {}",
-        pos_pcap_str,
-        mixed_pcap_path
+        pos_pcap_str, mixed_pcap_path
     );
 
     match merger::merge_pcap(&pos_pcap_str, &neg_pcap_str, &prefix_str, sampling_rate) {
@@ -132,7 +132,13 @@ fn main() -> Result<()> {
                 },
             };
 
-            run_one_scenario(workspace_dir, &attack.name, &pos_fragment_path, &neg_pcap_path, sampling_rate)?;
+            run_one_scenario(
+                workspace_dir,
+                &attack.name,
+                &pos_fragment_path,
+                &neg_pcap_path,
+                sampling_rate,
+            )?;
         }
 
         info!("🎉 Pipeline completed successfully.");
@@ -149,28 +155,54 @@ fn main() -> Result<()> {
             .as_ref()
             .context("neg_glob is required in folder mode")?;
 
-        // Collect POS pcaps via glob
+        // Collect POS inputs.
+        // Supported layouts:
+        //   (A) pos_dir/*.pcap
+        //   (B) pos_dir/<scenario_dir>/*.pcap
+        let pos_input_path = Path::new(pos_input_str);
         let mut pos_files: Vec<PathBuf> = Vec::new();
-        let pos_input_path = Path::new(pos_input_str).to_owned();
         if pos_input_path.is_dir() {
             for entry in std::fs::read_dir(pos_input_path)? {
-                let p = entry?.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("pcap") {
-                    pos_files.push(p);
+                let entry = entry?;
+                let p = entry.path();
+                let ft = entry.file_type()?;
+
+                if ft.is_file() {
+                    if p.extension().and_then(|s| s.to_str()) == Some("pcap") {
+                        pos_files.push(p);
+                    }
+                    continue;
+                }
+
+                if ft.is_dir() {
+                    let scenario_dir = p;
+                    let scenario_name = scenario_dir
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("scenario")
+                        .to_string();
+
+                    let output_path = workspace_dir.join(format!("{}.pcap", scenario_name));
+                    compact_pcap(&scenario_dir, &output_path)
+                        .with_context(|| format!("Failed to compact POS scenario: {}", scenario_dir.display()))?;
+                    pos_files.push(output_path);
                 }
             }
+
             pos_files.sort_by(|a, b| natord::compare(&a.to_string_lossy(), &b.to_string_lossy()));
         } else if pos_input_path.extension().and_then(|s| s.to_str()) == Some("pcap") {
-            pos_files.push(pos_input_path);
+            pos_files.push(pos_input_path.to_owned());
         }
+
         if pos_files.is_empty() {
             anyhow::bail!("No POS pcap files matched: {}", pos_input_str);
         }
 
-        // Prepare NEG pcap into workspace/BENIGN.pcap (existing helper)
-        let neg_pcap_path_str = parser::compact_neg_pkt(neg_glob, workspace_str)
-            .context("Failed to compact NEG pcaps")?;
-        let neg_pcap_path = PathBuf::from(&neg_pcap_path_str);
+        let neg_pcap_path = Path::new(workspace_dir).join("BENIGM.pcap");
+        if let Err(_) = compact_pcap(&neg_glob, &neg_pcap_path) {
+            anyhow::bail!("Failed to compact NEG pcaps")
+        }
+
         if !neg_pcap_path.exists() {
             anyhow::bail!("NEG pcap not found after compacting: {}", neg_pcap_path.display());
         }

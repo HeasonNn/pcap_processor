@@ -2,8 +2,7 @@ use anyhow::Result;
 use chrono::NaiveDateTime;
 use log::{info, warn};
 use pcap::{Capture, Linktype, Packet, Savefile};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
@@ -216,134 +215,114 @@ pub fn parse_packet(packet: &Packet, link_type: Linktype) -> Option<PacketMeta> 
     })
 }
 
-#[derive(Debug)]
-struct HeapEntry {
-    ts_ns: u64,
-    file_idx: usize,
-    header: pcap::PacketHeader,
-    data: Vec<u8>,
-}
+pub fn compact_pcap(input_path: impl AsRef<Path>, output_path: impl AsRef<Path>) -> Result<()> {
+    let input_path = input_path.as_ref();
+    let output_path = output_path.as_ref();
 
-impl Eq for HeapEntry {}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.ts_ns == other.ts_ns && self.file_idx == other.file_idx
-    }
-}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.ts_ns, self.file_idx).cmp(&(other.ts_ns, other.file_idx))
-    }
-}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-pub fn compact_neg_pkt(neg_pcap_path: &str, output_dir: &str) -> Result<String> {
-    let input_path = Path::new(neg_pcap_path);
     let mut files = vec![];
-    if input_path.is_dir() {
-        for entry in std::fs::read_dir(input_path)? {
-            let p = entry?.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("pcap") {
-                files.push(p);
-            }
+    for entry in std::fs::read_dir(input_path)? {
+        let p = entry?.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("pcap") {
+            files.push(p);
         }
-        files.sort_by(|a, b| natord::compare(&a.to_string_lossy(), &b.to_string_lossy()));
-    } else {
-        return Ok(neg_pcap_path.to_string());
     }
+    files.sort_by(|a, b| natord::compare(&a.to_string_lossy(), &b.to_string_lossy()));
 
     if files.is_empty() {
-        anyhow::bail!("No pcap files found in {}", neg_pcap_path);
+        anyhow::bail!("No pcap files found in {}", input_path.display());
     }
 
     let output_linktype = Linktype::ETHERNET;
-    info!(
-        "🔗 NEG compact output Linktype forced to {:?} (Ethernet)",
-        output_linktype
-    );
+    info!("🔗 Compact output Linktype forced to {:?} (Ethernet)", output_linktype);
 
     let dead_cap = Capture::dead(output_linktype)?;
-    let neg_path = Path::new(output_dir).join("BENIGN.pcap");
-    let neg_path_str = neg_path.to_string_lossy().to_string();
-    let mut writer = dead_cap.savefile(&neg_path_str)?;
+    let mut writer = dead_cap.savefile(output_path)?;
+    let mut cursor_ns: u64 = 0;
+    let gap_ns: u64 = 1_000_000; // 1ms gap between files
 
-    info!("⚡ Compacting {} files (timestamp-ordered merge)...", files.len());
+    info!(
+        "⚡ Compacting {} files (sequential time-aligned concat)...",
+        files.len()
+    );
 
-    let mut caps: Vec<Option<(Capture<pcap::Offline>, Linktype)>> = Vec::with_capacity(files.len());
-    let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::new();
+    let mut total: u64 = 0;
+
     for (i, file_path) in files.iter().enumerate() {
         let mut cap = match Capture::from_file(file_path) {
             Ok(c) => c,
             Err(e) => {
                 warn!("Skipping {:?}: {}", file_path, e);
-                caps.push(None);
                 continue;
             },
         };
         let lt = cap.get_datalink();
-        match cap.next_packet() {
-            Ok(pkt) => {
-                if let Some((new_hdr, new_data)) = wrap_to_ethernet(&pkt, lt) {
-                    let ts_ns = (new_hdr.ts.tv_sec as u64) * 1_000_000_000 + (new_hdr.ts.tv_usec as u64) * 1_000;
-                    heap.push(Reverse(HeapEntry {
-                        ts_ns,
-                        file_idx: i,
-                        header: new_hdr,
-                        data: new_data,
-                    }));
+
+        // Find the first *wrappable* packet to define this file's local time origin.
+        let mut file_first_ts_ns: Option<u64> = None;
+        let mut file_last_ts_ns: u64 = 0;
+        let mut wrote_any = false;
+
+        while let Ok(pkt) = cap.next_packet() {
+            if let Some((mut new_hdr, new_data)) = wrap_to_ethernet(&pkt, lt) {
+                let ts_ns = (new_hdr.ts.tv_sec as u64) * 1_000_000_000 + (new_hdr.ts.tv_usec as u64) * 1_000;
+
+                if file_first_ts_ns.is_none() {
+                    file_first_ts_ns = Some(ts_ns);
                 }
-                caps.push(Some((cap, lt)));
-            },
-            Err(_) => {
-                warn!("Empty pcap: {:?}", file_path);
-                caps.push(Some((cap, lt)));
-            },
-        }
-    }
+                let base = file_first_ts_ns.unwrap();
+                let rel_ns = ts_ns.saturating_sub(base);
+                let new_ts = cursor_ns.saturating_add(rel_ns);
 
-    let mut count: u64 = 0;
-    while let Some(Reverse(entry)) = heap.pop() {
-        let idx = entry.file_idx;
-        let pkt_ref = Packet {
-            header: &entry.header,
-            data: &entry.data,
-        };
-        writer.write(&pkt_ref);
+                new_hdr.ts.tv_sec = (new_ts / 1_000_000_000) as _;
+                new_hdr.ts.tv_usec = ((new_ts % 1_000_000_000) / 1_000) as _;
 
-        count += 1;
-        if count % 5_000_000 == 0 {
-            info!("   Processed {} packets...", count);
-        }
+                let pkt_ref = Packet {
+                    header: &new_hdr,
+                    data: &new_data,
+                };
+                writer.write(&pkt_ref);
 
-        if let Some(Some((cap, lt))) = caps.get_mut(idx) {
-            match cap.next_packet() {
-                Ok(pkt) => {
-                    if let Some((new_hdr, new_data)) = wrap_to_ethernet(&pkt, *lt) {
-                        let ts_ns = (new_hdr.ts.tv_sec as u64) * 1_000_000_000 + (new_hdr.ts.tv_usec as u64) * 1_000;
-                        heap.push(Reverse(HeapEntry {
-                            ts_ns,
-                            file_idx: idx,
-                            header: new_hdr,
-                            data: new_data,
-                        }));
-                    }
-                },
-                Err(pcap::Error::NoMorePackets) => {},
-                Err(_) => {},
+                wrote_any = true;
+                total += 1;
+                file_last_ts_ns = ts_ns;
+
+                if total % 5_000_000 == 0 {
+                    info!("   Processed {} packets...", total);
+                }
+            } else {
+                continue;
             }
+        }
+
+        if wrote_any {
+            let base = file_first_ts_ns.unwrap_or(file_last_ts_ns);
+            let dur = file_last_ts_ns.saturating_sub(base);
+            cursor_ns = cursor_ns.saturating_add(dur.saturating_add(gap_ns));
+            info!(
+                "   [{} / {}] {} -> wrote packets, duration={} ns, next_cursor={} ns",
+                i + 1,
+                files.len(),
+                file_path.display(),
+                dur,
+                cursor_ns
+            );
+        } else {
+            warn!(
+                "   [{} / {}] {} -> no usable packets",
+                i + 1,
+                files.len(),
+                file_path.display()
+            );
         }
     }
 
     writer.flush()?;
-    info!("✅ Compacted into {} ({} packets, Ethernet)", neg_path_str, count);
-    Ok(neg_path_str)
+    info!(
+        "✅ Compacted into {} ({} packets, Ethernet, continuous timeline)",
+        output_path.display(),
+        total
+    );
+    Ok(())
 }
 
 pub fn filter_malicious_pkt(
