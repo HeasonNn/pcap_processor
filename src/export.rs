@@ -1,4 +1,4 @@
-use crate::common::{FlowFeature,PacketMeta};
+use crate::common::{FlowFeature, PacketMeta};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufWriter, Write};

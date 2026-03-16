@@ -287,7 +287,7 @@ pub fn compact_pcap(input_path: impl AsRef<Path>, output_path: impl AsRef<Path>)
                 file_last_ts_ns = ts_ns;
 
                 if total % 5_000_000 == 0 {
-                    info!("   Processed {} packets...", total);
+                    info!("Processed {} packets...", total);
                 }
             } else {
                 continue;
@@ -299,7 +299,7 @@ pub fn compact_pcap(input_path: impl AsRef<Path>, output_path: impl AsRef<Path>)
             let dur = file_last_ts_ns.saturating_sub(base);
             cursor_ns = cursor_ns.saturating_add(dur.saturating_add(gap_ns));
             info!(
-                "   [{} / {}] {} -> wrote packets, duration={} ns, next_cursor={} ns",
+                "[{} / {}] {} -> wrote packets, duration={} ns, next_cursor={} ns",
                 i + 1,
                 files.len(),
                 file_path.display(),
@@ -308,7 +308,7 @@ pub fn compact_pcap(input_path: impl AsRef<Path>, output_path: impl AsRef<Path>)
             );
         } else {
             warn!(
-                "   [{} / {}] {} -> no usable packets",
+                "[{} / {}] {} -> no usable packets",
                 i + 1,
                 files.len(),
                 file_path.display()
@@ -412,7 +412,7 @@ pub fn filter_malicious_pkt(
 
             count += 1;
             if count % 5_000_000 == 0 {
-                info!("   Processed {} packets...", count);
+                info!("Processed {} packets...", count);
             }
         }
     }

@@ -253,14 +253,11 @@ impl FlowAccumulator {
 fn decode_proto(code: u16) -> u8 {
     if (code & (0xF0)) != 0 {
         6
-    }
-    else if (code & (1 << 8)) != 0 {
+    } else if (code & (1 << 8)) != 0 {
         17
-    }
-    else if (code & (1 << 2)) != 0 {
+    } else if (code & (1 << 2)) != 0 {
         1
-    }
-    else {
+    } else {
         0
     }
 }

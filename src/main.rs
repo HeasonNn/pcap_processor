@@ -27,6 +27,7 @@ fn run_one_scenario(
     pos_pcap_path: impl AsRef<Path>,
     neg_pcap_path: impl AsRef<Path>,
     sampling_rate: f64,
+    write_mixed_pcap: bool,
 ) -> Result<()> {
     let dataset_prefix_path = workspace_dir.as_ref().join(scenario_name);
     let prefix_str = dataset_prefix_path.to_string_lossy().to_string();
@@ -35,27 +36,30 @@ fn run_one_scenario(
     let pos_pcap_str = pos_pcap_path.as_ref().to_string_lossy().to_string();
     let neg_pcap_str = neg_pcap_path.as_ref().to_string_lossy().to_string();
 
-    info!(
-        "   Merge+Export: {} + NEG (Sampled) -> {}",
-        pos_pcap_str, mixed_pcap_path
-    );
+    info!("Merge+Export: {} + NEG (Sampled) -> {}", pos_pcap_str, mixed_pcap_path);
 
-    match merger::merge_pcap(&pos_pcap_str, &neg_pcap_str, &prefix_str, sampling_rate) {
+    match merger::merge_pcap(
+        &pos_pcap_str,
+        &neg_pcap_str,
+        &prefix_str,
+        sampling_rate,
+        write_mixed_pcap,
+    ) {
         Ok(count) => {
-            info!("   ✅ Merge+Export success. Total packets: {}", count);
+            info!("✅ Merge+Export success. Total packets: {}", count);
 
             let data_file = format!("{}.data", prefix_str);
             let label_file = format!("{}.label", prefix_str);
             let csv_path = format!("{}.csv", prefix_str);
-            info!("   Flow: Constructing flows -> {}", csv_path);
+            info!("Flow: Constructing flows -> {}", csv_path);
 
             let engine = flow::FlowEngine::new(5_000_000);
             match engine.run(&data_file, &label_file, &csv_path) {
-                Ok(_) => info!("   ✅ Flow CSV generated: {}", scenario_name),
-                Err(e) => error!("   ❌ Flow Construction failed: {}", e),
+                Ok(_) => info!("✅ Flow CSV generated: {}", scenario_name),
+                Err(e) => error!("❌ Flow Construction failed: {}", e),
             }
         },
-        Err(e) => error!("   ❌ Merge+Export failed: {}", e),
+        Err(e) => error!("❌ Merge+Export failed: {}", e),
     }
     Ok(())
 }
@@ -77,6 +81,7 @@ fn main() -> Result<()> {
     let workspace_dir = Path::new(workspace_str);
     let mode = &config.global.mode;
     let sampling_rate = config.global.neg_sampling_rate;
+    let write_mixed_pcap = config.global.write_mixed_pcap.unwrap_or(true);
 
     ensure_dir(workspace_dir)?;
 
@@ -114,7 +119,7 @@ fn main() -> Result<()> {
             info!(">>> [{}/{}] Scenario: {}", idx + 1, config.attacks.len(), attack.name);
 
             if attack.rules.is_empty() {
-                warn!("   Skipping scenario '{}' (No rules defined)", attack.name);
+                warn!("Skipping scenario '{}' (No rules defined)", attack.name);
                 continue;
             }
 
@@ -138,6 +143,7 @@ fn main() -> Result<()> {
                 &pos_fragment_path,
                 &neg_pcap_path,
                 sampling_rate,
+                write_mixed_pcap,
             )?;
         }
 
@@ -199,8 +205,8 @@ fn main() -> Result<()> {
         }
 
         let neg_pcap_path = Path::new(workspace_dir).join("BENIGM.pcap");
-        if let Err(_) = compact_pcap(&neg_glob, &neg_pcap_path) {
-            anyhow::bail!("Failed to compact NEG pcaps")
+        if let Err(e) = compact_pcap(&neg_glob, &neg_pcap_path) {
+            anyhow::bail!("Failed to compact NEG pcaps: {}", e)
         }
 
         if !neg_pcap_path.exists() {
@@ -209,8 +215,8 @@ fn main() -> Result<()> {
 
         info!("🚀 Folder-mode Pipeline started. Workspace: {}", workspace_str);
         info!("🎲 NEG Sampling Rate: {:.2}%", sampling_rate * 100.0);
-        info!("   POS files: {}", pos_files.len());
-        info!("   NEG file: {}", neg_pcap_path.display());
+        info!("POS files: {}", pos_files.len());
+        info!("NEG file: {}", neg_pcap_path.display());
 
         for (idx, pos_file) in pos_files.iter().enumerate() {
             let scenario = pos_file.file_stem().and_then(|s| s.to_str()).unwrap_or("pos");
@@ -218,7 +224,14 @@ fn main() -> Result<()> {
             info!("------------------------------------------------");
             info!(">>> [{}/{}] Scenario: {}", idx + 1, pos_files.len(), scenario);
 
-            run_one_scenario(workspace_dir, scenario, pos_file, &neg_pcap_path, sampling_rate)?;
+            run_one_scenario(
+                workspace_dir,
+                scenario,
+                pos_file,
+                &neg_pcap_path,
+                sampling_rate,
+                write_mixed_pcap,
+            )?;
         }
 
         info!("🎉 Pipeline completed successfully.");

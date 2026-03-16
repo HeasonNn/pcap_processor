@@ -19,14 +19,16 @@ pub struct HashSamplingStrategy {
     attack_str: String,
     benign_str: String,
     sampling_rate: f64,
+    write_mixed_pcap: bool,
 }
 
 impl HashSamplingStrategy {
-    pub fn new(attack_str: &str, benign_str: &str, sampling_rate: f64) -> Self {
+    pub fn new(attack_str: &str, benign_str: &str, sampling_rate: f64, write_mixed_pcap: bool) -> Self {
         Self {
             attack_str: attack_str.to_string(),
             benign_str: benign_str.to_string(),
             sampling_rate,
+            write_mixed_pcap,
         }
     }
 }
@@ -46,8 +48,12 @@ impl MergeStrategy for HashSamplingStrategy {
         atk_stream.open_next()?;
         ben_stream.open_next()?;
 
-        let cap_dead = Capture::dead(out_linktype)?;
-        let mut pcap_writer = cap_dead.savefile(format!("{}_mixed.pcap", output_prefix_str))?;
+        let mut pcap_writer = if self.write_mixed_pcap {
+            let cap_dead = Capture::dead(out_linktype)?;
+            Some(cap_dead.savefile(format!("{}_mixed.pcap", output_prefix_str))?)
+        } else {
+            None
+        };
         let mut ds_writer = DatasetWriter::new(output_prefix_str)?;
 
         let (mut curr_atk, mut curr_atk_lt) = match atk_stream.next_packet_with_linktype() {
@@ -84,7 +90,7 @@ impl MergeStrategy for HashSamplingStrategy {
             if atk_ts <= ben_ts {
                 curr_atk.set_timestamp(atk_ts);
                 write_pcap_and_dataset(
-                    &mut pcap_writer,
+                    pcap_writer.as_mut(),
                     &mut ds_writer,
                     out_linktype,
                     &curr_atk,
@@ -118,7 +124,7 @@ impl MergeStrategy for HashSamplingStrategy {
 
                 b.set_timestamp(ben_ts);
                 write_pcap_and_dataset(
-                    &mut pcap_writer,
+                    pcap_writer.as_mut(),
                     &mut ds_writer,
                     out_linktype,
                     &b,
@@ -132,7 +138,9 @@ impl MergeStrategy for HashSamplingStrategy {
                 break;
             }
         }
-        pcap_writer.flush()?;
+        if let Some(writer) = pcap_writer.as_mut() {
+            writer.flush()?;
+        }
         ds_writer.flush()?;
         if ds_written == 0 {
             warn!("⚠️ Dataset export produced 0 rows (skipped {}).", ds_skipped);
@@ -150,6 +158,7 @@ pub struct BudgetControlStrategy {
     attack_ratio: f64,
     time_bins: usize,
     bidirectional: bool,
+    write_mixed_pcap: bool,
 }
 
 impl BudgetControlStrategy {
@@ -160,6 +169,7 @@ impl BudgetControlStrategy {
         attack_ratio: f64,
         time_bins: usize,
         bidirectional: bool,
+        write_mixed_pcap: bool,
     ) -> Self {
         Self {
             attack_str: attack_str.to_string(),
@@ -168,6 +178,7 @@ impl BudgetControlStrategy {
             attack_ratio,
             time_bins,
             bidirectional,
+            write_mixed_pcap,
         }
     }
 }
@@ -202,8 +213,12 @@ impl MergeStrategy for BudgetControlStrategy {
         atk_stream.open_next()?;
         ben_stream.open_next()?;
 
-        let cap_dead = Capture::dead(out_linktype)?;
-        let mut pcap_writer = cap_dead.savefile(format!("{}_mixed.pcap", output_prefix_str))?;
+        let mut pcap_writer = if self.write_mixed_pcap {
+            let cap_dead = Capture::dead(out_linktype)?;
+            Some(cap_dead.savefile(format!("{}_mixed.pcap", output_prefix_str))?)
+        } else {
+            None
+        };
         let mut ds_writer = DatasetWriter::new(output_prefix_str)?;
         let mut ds_written = 0usize;
         let mut ds_skipped = 0usize;
@@ -239,7 +254,7 @@ impl MergeStrategy for BudgetControlStrategy {
             if atk_ts <= ben_ts {
                 curr_atk.set_timestamp(atk_ts);
                 write_pcap_and_dataset(
-                    &mut pcap_writer,
+                    pcap_writer.as_mut(),
                     &mut ds_writer,
                     out_linktype,
                     &curr_atk,
@@ -259,7 +274,7 @@ impl MergeStrategy for BudgetControlStrategy {
             } else if let Some((mut b, b_lt)) = curr_ben {
                 b.set_timestamp(ben_ts);
                 write_pcap_and_dataset(
-                    &mut pcap_writer,
+                    pcap_writer.as_mut(),
                     &mut ds_writer,
                     out_linktype,
                     &b,
@@ -276,7 +291,9 @@ impl MergeStrategy for BudgetControlStrategy {
             }
         }
 
-        pcap_writer.flush()?;
+        if let Some(writer) = pcap_writer.as_mut() {
+            writer.flush()?;
+        }
         ds_writer.flush()?;
         if ds_written == 0 {
             warn!("⚠️ Dataset export produced 0 rows (skipped {}).", ds_skipped);
@@ -287,7 +304,13 @@ impl MergeStrategy for BudgetControlStrategy {
     }
 }
 
-pub fn merge_pcap(attack_str: &str, benign_str: &str, output_prefix_str: &str, sampling_rate: f64) -> Result<usize> {
+pub fn merge_pcap(
+    attack_str: &str,
+    benign_str: &str,
+    output_prefix_str: &str,
+    sampling_rate: f64,
+    write_mixed_pcap: bool,
+) -> Result<usize> {
     let controlled_total_pkts = env::var("PCAP_MERGE_TOTAL_PKTS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
@@ -307,10 +330,21 @@ pub fn merge_pcap(attack_str: &str, benign_str: &str, output_prefix_str: &str, s
                 .unwrap_or(false);
 
             Box::new(BudgetControlStrategy::new(
-                attack_str, benign_str, total, ratio, bins, bidir,
+                attack_str,
+                benign_str,
+                total,
+                ratio,
+                bins,
+                bidir,
+                write_mixed_pcap,
             ))
         } else {
-            Box::new(HashSamplingStrategy::new(attack_str, benign_str, sampling_rate))
+            Box::new(HashSamplingStrategy::new(
+                attack_str,
+                benign_str,
+                sampling_rate,
+                write_mixed_pcap,
+            ))
         };
 
     strategy.execute(output_prefix_str)
@@ -351,7 +385,7 @@ fn wrap_owned_to_ethernet(op: &OwnedPacket, link_type: Linktype) -> Option<Owned
 }
 
 fn write_pcap_and_dataset(
-    pcap_writer: &mut pcap::Savefile,
+    pcap_writer: Option<&mut pcap::Savefile>,
     ds_writer: &mut DatasetWriter,
     out_linktype: Linktype,
     op: &OwnedPacket,
@@ -362,7 +396,9 @@ fn write_pcap_and_dataset(
 ) -> Result<()> {
     if let Some(wp) = wrap_owned_to_ethernet(op, op_lt) {
         let pkt_ref = wp.as_pcap_packet();
-        pcap_writer.write(&pkt_ref);
+        if let Some(writer) = pcap_writer {
+            writer.write(&pkt_ref);
+        }
         if let Some(meta) = crate::parser::parse_packet(&pkt_ref, out_linktype) {
             ds_writer.write_from_meta(&meta, is_pos)?;
             *ds_written += 1;
@@ -569,6 +605,41 @@ fn parse_packet_to_key(pkt: &OwnedPacket, link_type: Linktype) -> Option<FlowKey
             Some(FlowKey::new(src_ip, dst_ip, sport, dport, proto))
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_pcap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_prefix(name: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("pcap_processor_{name}_{nanos}"))
+    }
+
+    #[test]
+    fn merge_can_skip_mixed_pcap_but_keep_dataset_files() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let pos = root.join("data/pos/pos.pcap");
+        let neg = root.join("data/neg/neg.pcap");
+        let prefix = unique_prefix("skip_mixed");
+        let prefix_str = prefix.to_string_lossy().to_string();
+
+        let _ = merge_pcap(&pos.to_string_lossy(), &neg.to_string_lossy(), &prefix_str, 1.0, false).unwrap();
+
+        assert!(prefix.with_extension("data").exists());
+        assert!(prefix.with_extension("label").exists());
+        assert!(!prefix
+            .parent()
+            .unwrap()
+            .join(format!("{}_mixed.pcap", prefix.file_name().unwrap().to_string_lossy()))
+            .exists());
+
+        let _ = fs::remove_file(prefix.with_extension("data"));
+        let _ = fs::remove_file(prefix.with_extension("label"));
     }
 }
 
