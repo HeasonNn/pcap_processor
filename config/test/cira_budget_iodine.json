@@ -1,0 +1,11 @@
+{
+    "global": {
+        "mode": "folder",
+        "pos_glob": "data/cira_budget_iodine/pos",
+        "neg_glob": "data/cira_budget/neg/AdGuard",
+        "output_dir": "./data/experiments/cira_budget_iodine",
+        "neg_sampling_rate": 1.0,
+        "write_mixed_pcap": false
+    },
+    "attacks": []
+}

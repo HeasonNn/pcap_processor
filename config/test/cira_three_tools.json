@@ -1,0 +1,11 @@
+{
+    "global": {
+        "mode": "folder",
+        "pos_glob": "data/cira_three/pos",
+        "neg_glob": "data/cira_minimal/neg/AdGuard",
+        "output_dir": "./data/experiments/cira_three_tools",
+        "neg_sampling_rate": 1.0,
+        "write_mixed_pcap": false
+    },
+    "attacks": []
+}
