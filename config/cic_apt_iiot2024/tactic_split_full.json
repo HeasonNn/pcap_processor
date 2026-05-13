@@ -1,0 +1,456 @@
+{
+  "global": {
+    "mode": "rules",
+    "output_dir": "data/experiments/cic_apt_iiot2024_tactic_split_full",
+    "raw_pcap": "data/raw/CIC_APT_IIoT2024/downloaded_CICAPT_IIoT/CICAPT-IIoT Dataset/Network_Traffic/Phase2/2ndPhase-timed-MergedV2.pcap",
+    "neg_sampling_rate": 1.0,
+    "write_mixed_pcap": false
+  },
+  "attacks": [
+    {
+      "name": "cleanup",
+      "rules": [
+        {
+          "attack_type": "cleanup",
+          "start_time": "2023-12-03 23:00:55",
+          "end_time": "2023-12-03 23:12:55",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "collection",
+      "rules": [
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-01 18:23:07",
+          "end_time": "2023-12-01 18:35:37",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-01 19:23:02",
+          "end_time": "2023-12-01 19:35:02",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-01 20:29:08",
+          "end_time": "2023-12-01 20:41:08",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-01 21:31:20",
+          "end_time": "2023-12-01 21:43:20",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-01 22:43:16",
+          "end_time": "2023-12-01 22:55:16",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-01 23:49:26",
+          "end_time": "2023-12-02 00:01:26",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 00:59:26",
+          "end_time": "2023-12-02 01:11:26",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 02:01:49",
+          "end_time": "2023-12-02 02:13:49",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 03:01:09",
+          "end_time": "2023-12-02 03:13:09",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 04:11:57",
+          "end_time": "2023-12-02 04:23:57",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 05:12:29",
+          "end_time": "2023-12-02 05:24:29",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 06:08:37",
+          "end_time": "2023-12-02 06:20:37",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 07:01:37",
+          "end_time": "2023-12-02 07:13:37",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 07:52:54",
+          "end_time": "2023-12-02 08:04:54",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 08:49:38",
+          "end_time": "2023-12-02 09:01:38",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 09:41:13",
+          "end_time": "2023-12-02 09:53:13",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 10:41:29",
+          "end_time": "2023-12-02 10:53:29",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 11:52:56",
+          "end_time": "2023-12-02 12:04:56",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 12:35:21",
+          "end_time": "2023-12-02 12:47:21",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 13:25:30",
+          "end_time": "2023-12-02 13:37:30",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-02 14:34:59",
+          "end_time": "2023-12-02 14:46:59",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-03 09:31:11",
+          "end_time": "2023-12-03 09:43:11",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "collection",
+          "start_time": "2023-12-03 10:40:38",
+          "end_time": "2023-12-03 10:52:38",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "command_and_control",
+      "rules": [
+        {
+          "attack_type": "command_and_control",
+          "start_time": "2023-12-02 19:00:49",
+          "end_time": "2023-12-02 19:12:49",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "command_and_control",
+          "start_time": "2023-12-02 19:45:30",
+          "end_time": "2023-12-02 19:57:30",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "command_and_control",
+          "start_time": "2023-12-03 06:28:11",
+          "end_time": "2023-12-03 06:40:11",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "credential_access",
+      "rules": [
+        {
+          "attack_type": "credential_access",
+          "start_time": "2023-12-03 05:14:12",
+          "end_time": "2023-12-03 05:26:12",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "credential_access",
+          "start_time": "2023-12-03 07:35:37",
+          "end_time": "2023-12-03 07:47:37",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "credential_access",
+          "start_time": "2023-12-03 08:39:04",
+          "end_time": "2023-12-03 08:51:04",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "credential_access",
+          "start_time": "2023-12-03 11:29:37",
+          "end_time": "2023-12-03 11:41:37",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "discovery",
+      "rules": [
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-02 20:33:44",
+          "end_time": "2023-12-02 20:45:44",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-02 21:34:39",
+          "end_time": "2023-12-02 21:46:39",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-02 22:34:32",
+          "end_time": "2023-12-02 22:46:32",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-02 23:44:54",
+          "end_time": "2023-12-02 23:56:54",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-03 00:42:35",
+          "end_time": "2023-12-03 00:54:35",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-03 01:34:01",
+          "end_time": "2023-12-03 01:46:01",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-03 02:24:22",
+          "end_time": "2023-12-03 02:36:22",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-03 03:22:48",
+          "end_time": "2023-12-03 03:34:48",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "discovery",
+          "start_time": "2023-12-03 12:23:03",
+          "end_time": "2023-12-03 12:35:03",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "exfiltration",
+      "rules": [
+        {
+          "attack_type": "exfiltration",
+          "start_time": "2023-12-02 15:23:37",
+          "end_time": "2023-12-02 15:35:37",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "exfiltration",
+          "start_time": "2023-12-02 16:34:12",
+          "end_time": "2023-12-02 16:46:12",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        },
+        {
+          "attack_type": "exfiltration",
+          "start_time": "2023-12-02 17:44:07",
+          "end_time": "2023-12-02 17:56:07",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "lateral_movement",
+      "rules": [
+        {
+          "attack_type": "lateral_movement",
+          "start_time": "2023-12-03 13:11:05",
+          "end_time": "2023-12-03 13:23:05",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "persistence",
+      "rules": [
+        {
+          "attack_type": "persistence",
+          "start_time": "2023-12-03 04:16:44",
+          "end_time": "2023-12-03 04:28:44",
+          "attackers": [
+            "172.16.65.128",
+            "200.200.200.10"
+          ]
+        }
+      ]
+    }
+  ]
+}

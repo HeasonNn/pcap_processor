@@ -1,0 +1,22 @@
+{
+  "global": {
+    "mode": "rules",
+    "output_dir": "data/experiments/cic_apt_iiot2024_phase2_split_trial",
+    "raw_pcap": "data/raw/CIC_APT_IIoT2024/downloaded_CICAPT_IIoT/CICAPT-IIoT Dataset/Network_Traffic/Phase2/2ndPhase-timed-MergedV2.pcap",
+    "neg_sampling_rate": 1.0,
+    "write_mixed_pcap": false
+  },
+  "attacks": [
+    {
+      "name": "apt29_phase2",
+      "rules": [
+        {
+          "attack_type": "apt29_phase2",
+          "start_time": "2023-12-01 18:25:07",
+          "end_time": "2023-12-03 23:15:00",
+          "attackers": ["172.16.65.128", "200.200.200.10"]
+        }
+      ]
+    }
+  ]
+}

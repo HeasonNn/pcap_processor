@@ -21,11 +21,23 @@ impl FlowEngine {
     }
 
     pub fn run(&self, data_path: &str, label_path: &str, output_csv: &str) -> Result<()> {
-        let file_data = File::open(data_path).context("Failed to open .data file")?;
         let file_label = File::open(label_path).context("Failed to open .label file")?;
+        self.run_with_labels(data_path, Some(BufReader::new(file_label)), output_csv)
+    }
+
+    pub fn run_benign(&self, data_path: &str, output_csv: &str) -> Result<()> {
+        self.run_with_labels(data_path, None, output_csv)
+    }
+
+    fn run_with_labels(
+        &self,
+        data_path: &str,
+        mut reader_label: Option<BufReader<File>>,
+        output_csv: &str,
+    ) -> Result<()> {
+        let file_data = File::open(data_path).context("Failed to open .data file")?;
 
         let mut reader_data = BufReader::new(file_data);
-        let mut reader_label = BufReader::new(file_label);
         let mut exporter = CsvExporter::new(output_csv)?;
 
         let mut batch_idx = 0;
@@ -46,16 +58,20 @@ impl FlowEngine {
                 }
                 lines_data.push(line.trim_end().to_string());
 
-                let mut byte_buf = [0u8; 1];
-                loop {
-                    if reader_label.read(&mut byte_buf)? == 0 {
-                        break;
+                if let Some(reader_label) = reader_label.as_mut() {
+                    let mut byte_buf = [0u8; 1];
+                    loop {
+                        if reader_label.read(&mut byte_buf)? == 0 {
+                            break;
+                        }
+                        let c = byte_buf[0];
+                        if c == b'0' || c == b'1' {
+                            buf_label.push(c == b'1');
+                            break;
+                        }
                     }
-                    let c = byte_buf[0];
-                    if c == b'0' || c == b'1' {
-                        buf_label.push(c == b'1');
-                        break;
-                    }
+                } else {
+                    buf_label.push(false);
                 }
             }
 
@@ -76,8 +92,7 @@ impl FlowEngine {
             let mut shards: Vec<Vec<RawPacket>> = vec![Vec::new(); num_shards];
 
             for pkt in packets {
-                let proto_u8 = decode_proto(pkt.proto_code);
-                let key = FlowKey::new(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port, proto_u8).canonical();
+                let key = FlowKey::new(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port, pkt.protocol).canonical();
 
                 let hash = key.get_hash();
                 let shard_idx = (hash as usize) % num_shards;
@@ -107,14 +122,22 @@ fn parse_line(line: &str, label: bool) -> Option<RawPacket> {
         return None;
     }
 
+    let (protocol, packet_code, len_idx) = if parts.len() >= 9 {
+        (u8::from_str(parts[6]).ok()?, u16::from_str(parts[7]).ok()?, 8)
+    } else {
+        let code = u16::from_str(parts[6]).ok()?;
+        (decode_proto(code), code, 7)
+    };
+
     Some(RawPacket {
         src_ip: IpAddr::from_str(parts[1]).ok()?,
         dst_ip: IpAddr::from_str(parts[2]).ok()?,
         src_port: u16::from_str(parts[3]).ok()?,
         dst_port: u16::from_str(parts[4]).ok()?,
         ts_ns: i64::from_str(parts[5]).ok()?,
-        proto_code: u16::from_str(parts[6]).ok()?,
-        len: u16::from_str(parts[7]).ok()?,
+        protocol,
+        packet_code,
+        len: u16::from_str(parts[len_idx]).ok()?,
         label,
     })
 }
@@ -124,8 +147,7 @@ fn process_shard(packets: Vec<RawPacket>) -> Vec<FlowFeature> {
     let mut completed_flows: Vec<FlowFeature> = Vec::new();
 
     for pkt in packets {
-        let proto_u8 = decode_proto(pkt.proto_code);
-        let key = FlowKey::new(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port, proto_u8);
+        let key = FlowKey::new(pkt.src_ip, pkt.dst_ip, pkt.src_port, pkt.dst_port, pkt.protocol);
 
         let mut evicted = None;
         if let Some(acc) = flow_map.get(&key) {

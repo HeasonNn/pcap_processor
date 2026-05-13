@@ -1,2 +1,12 @@
 /target
 /data
+/artifacts
+*.bak
+*.patch
+*.log
+*.data
+*.label
+*.csv
+*.pcap
+*.pcapng
+*.npz

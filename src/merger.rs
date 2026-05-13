@@ -304,6 +304,52 @@ impl MergeStrategy for BudgetControlStrategy {
     }
 }
 
+pub fn export_benign_dataset(benign_str: &str, output_prefix_str: &str, write_pcap: bool) -> Result<usize> {
+    info!(
+        "🚀 Exporting standalone benign dataset: {} -> {}",
+        benign_str, output_prefix_str
+    );
+
+    let mut ben_stream = PcapStreamer::new(benign_str, false)?;
+    ben_stream.open_next()?;
+
+    let out_linktype = Linktype::ETHERNET;
+    let mut pcap_writer = if write_pcap {
+        let cap_dead = Capture::dead(out_linktype)?;
+        Some(cap_dead.savefile(format!("{}.pcap", output_prefix_str))?)
+    } else {
+        None
+    };
+    let mut ds_writer = DatasetWriter::new_data_only(output_prefix_str)?;
+    let mut count = 0usize;
+    let mut ds_written = 0usize;
+    let mut ds_skipped = 0usize;
+
+    while let Some((packet, link_type)) = ben_stream.next_packet_with_linktype() {
+        write_pcap_and_dataset(
+            pcap_writer.as_mut(),
+            &mut ds_writer,
+            out_linktype,
+            &packet,
+            link_type,
+            false,
+            &mut ds_written,
+            &mut ds_skipped,
+        )?;
+        count += 1;
+    }
+
+    if let Some(writer) = pcap_writer.as_mut() {
+        writer.flush()?;
+    }
+    ds_writer.flush()?;
+    info!(
+        "   ✅ Benign dataset rows written: {} (skipped: {})",
+        ds_written, ds_skipped
+    );
+    Ok(count)
+}
+
 pub fn merge_pcap(
     attack_str: &str,
     benign_str: &str,
@@ -611,6 +657,7 @@ fn parse_packet_to_key(pkt: &OwnedPacket, link_type: Linktype) -> Option<FlowKey
 #[cfg(test)]
 mod tests {
     use super::merge_pcap;
+    use pcap::{Capture, Linktype, Packet, PacketHeader};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -620,11 +667,45 @@ mod tests {
         std::env::temp_dir().join(format!("pcap_processor_{name}_{nanos}"))
     }
 
+    fn ethernet_ipv4_tcp_packet() -> Vec<u8> {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        pkt.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        pkt.extend_from_slice(&[0x08, 0x00]);
+        pkt.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x00, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 1, 10, 0, 0, 2,
+        ]);
+        pkt.extend_from_slice(&[
+            0x30, 0x39, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x02, 0x20, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        pkt
+    }
+
+    fn write_test_pcap(path: &PathBuf) {
+        let dead = Capture::dead(Linktype::ETHERNET).unwrap();
+        let mut writer = dead.savefile(path).unwrap();
+        let data = ethernet_ipv4_tcp_packet();
+        let header = PacketHeader {
+            ts: unsafe { std::mem::zeroed() },
+            caplen: data.len() as u32,
+            len: data.len() as u32,
+        };
+        let packet = Packet::new(&header, &data);
+        writer.write(&packet);
+        writer.flush().unwrap();
+    }
+
     #[test]
     fn merge_can_skip_mixed_pcap_but_keep_dataset_files() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = unique_prefix("merge_inputs");
+        fs::create_dir_all(root.join("data/pos")).unwrap();
+        fs::create_dir_all(root.join("data/neg")).unwrap();
         let pos = root.join("data/pos/pos.pcap");
         let neg = root.join("data/neg/neg.pcap");
+        write_test_pcap(&pos);
+        write_test_pcap(&neg);
+
         let prefix = unique_prefix("skip_mixed");
         let prefix_str = prefix.to_string_lossy().to_string();
 
@@ -632,14 +713,17 @@ mod tests {
 
         assert!(prefix.with_extension("data").exists());
         assert!(prefix.with_extension("label").exists());
-        assert!(!prefix
-            .parent()
-            .unwrap()
-            .join(format!("{}_mixed.pcap", prefix.file_name().unwrap().to_string_lossy()))
-            .exists());
+        assert!(
+            !prefix
+                .parent()
+                .unwrap()
+                .join(format!("{}_mixed.pcap", prefix.file_name().unwrap().to_string_lossy()))
+                .exists()
+        );
 
         let _ = fs::remove_file(prefix.with_extension("data"));
         let _ = fs::remove_file(prefix.with_extension("label"));
+        let _ = fs::remove_dir_all(root);
     }
 }
 

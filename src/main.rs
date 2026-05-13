@@ -3,8 +3,10 @@ mod export;
 mod flow;
 mod merger;
 mod parser;
+mod pretrain_cache;
+mod stats;
 
-use crate::common::{Args, Config};
+use crate::common::{Args, Command, Config};
 use crate::parser::compact_pcap;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -17,6 +19,114 @@ fn ensure_dir<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
     let p = path.as_ref();
     if !p.exists() {
         std::fs::create_dir_all(p)?;
+    }
+    Ok(())
+}
+
+fn resolve_neg_pcap(shared_neg_pcap: Option<&str>, neg_glob: &str, workspace_dir: impl AsRef<Path>) -> Result<PathBuf> {
+    if let Some(shared_path) = shared_neg_pcap {
+        let resolved = PathBuf::from(shared_path);
+        if !resolved.exists() {
+            anyhow::bail!("Shared NEG pcap not found: {}", resolved.display());
+        }
+        return Ok(resolved);
+    }
+
+    let neg_pcap_path = workspace_dir.as_ref().join("BENIGN.pcap");
+    compact_pcap(neg_glob, &neg_pcap_path).context("Failed to compact NEG pcaps")?;
+
+    if !neg_pcap_path.exists() {
+        anyhow::bail!("NEG pcap not found after compacting: {}", neg_pcap_path.display());
+    }
+
+    Ok(neg_pcap_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_neg_pcap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("pcap_processor_{name}_{nanos}"))
+    }
+
+    #[test]
+    fn resolve_neg_pcap_prefers_shared_file() {
+        let workspace = unique_dir("shared_neg_workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let shared_neg = workspace.join("shared_benign.pcap");
+        fs::write(&shared_neg, b"pcap").unwrap();
+
+        let resolved = resolve_neg_pcap(
+            Some(shared_neg.as_os_str().to_string_lossy().as_ref()),
+            "unused-neg-input",
+            &workspace,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, shared_neg);
+
+        let _ = fs::remove_file(&shared_neg);
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn existing_config_without_shared_neg_still_parses() {
+        let cfg = r#"{
+            "global": {
+                "mode": "folder",
+                "pos_glob": "data/pos",
+                "neg_glob": "data/neg",
+                "output_dir": "./data/out",
+                "neg_sampling_rate": 1.0,
+                "write_mixed_pcap": false
+            },
+            "attacks": []
+        }"#;
+
+        let parsed: crate::common::Config = serde_json::from_str(cfg).unwrap();
+        assert!(parsed.global.shared_neg_pcap.is_none());
+    }
+}
+
+fn resolve_pretrain_neg_pcap(config: &Config, workspace_dir: impl AsRef<Path>) -> Result<Option<PathBuf>> {
+    if let Some(shared_path) = config.global.shared_pretrain_neg_pcap.as_deref() {
+        let resolved = PathBuf::from(shared_path);
+        if !resolved.exists() {
+            anyhow::bail!("Shared pretrain NEG pcap not found: {}", resolved.display());
+        }
+        return Ok(Some(resolved));
+    }
+
+    if let Some(pretrain_glob) = config.global.pretrain_neg_glob.as_deref() {
+        let pretrain_pcap_path = workspace_dir.as_ref().join("PRETRAIN_BENIGN.pcap");
+        compact_pcap(pretrain_glob, &pretrain_pcap_path).context("Failed to compact pretrain NEG pcaps")?;
+        return Ok(Some(pretrain_pcap_path));
+    }
+
+    Ok(None)
+}
+
+fn run_pretrain_benign_export(workspace_dir: impl AsRef<Path>, benign_pcap_path: impl AsRef<Path>) -> Result<()> {
+    let prefix_path = workspace_dir.as_ref().join("pretrain_benign");
+    let prefix_str = prefix_path.to_string_lossy().to_string();
+    let benign_pcap_str = benign_pcap_path.as_ref().to_string_lossy().to_string();
+
+    info!("Pretrain benign export: {} -> {}", benign_pcap_str, prefix_str);
+    let count = merger::export_benign_dataset(&benign_pcap_str, &prefix_str, false)?;
+    info!("✅ Pretrain benign .data generated. Total packets: {}", count);
+
+    let data_file = format!("{}.data", prefix_str);
+    let csv_path = format!("{}.csv", prefix_str);
+    let engine = flow::FlowEngine::new(5_000_000);
+    match engine.run_benign(&data_file, &csv_path) {
+        Ok(_) => info!("✅ Pretrain benign flow CSV generated"),
+        Err(e) => error!("❌ Pretrain benign flow construction failed: {}", e),
     }
     Ok(())
 }
@@ -68,11 +178,36 @@ fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = Args::parse();
 
-    // 1. Load config
-    let config_path = Path::new(&args.config);
-    if !config_path.exists() {
-        anyhow::bail!("Config file not found: {}", args.config);
+    match args.command {
+        Command::Process { config } => process_dataset(&config),
+        Command::Stats { config, output } => stats::run_stats(&config, &output),
+        Command::PretrainCache {
+            data,
+            out_dir,
+            packet_cutoff,
+            flow_timeout_s,
+            window_duration_s,
+            window_packet_limit,
+            shard_flows,
+            max_flows,
+            timeout_check_interval,
+            graph_token_count,
+        } => pretrain_cache::run(
+            &data,
+            &out_dir,
+            packet_cutoff,
+            flow_timeout_s,
+            window_duration_s,
+            window_packet_limit,
+            shard_flows,
+            max_flows,
+            timeout_check_interval,
+            graph_token_count,
+        ),
     }
+}
+
+fn process_dataset(config_path: &str) -> Result<()> {
     let file = File::open(config_path).context("Failed to open config file")?;
     let reader = BufReader::new(file);
     let config: Config = serde_json::from_reader(reader).context("Failed to parse config JSON")?;
@@ -84,6 +219,12 @@ fn main() -> Result<()> {
     let write_mixed_pcap = config.global.write_mixed_pcap.unwrap_or(true);
 
     ensure_dir(workspace_dir)?;
+
+    if let Some(pretrain_neg_pcap) = resolve_pretrain_neg_pcap(&config, workspace_dir)? {
+        run_pretrain_benign_export(workspace_dir, &pretrain_neg_pcap)?;
+    } else {
+        info!("No pretrain_neg_glob/shared_pretrain_neg_pcap configured; skipping standalone pretrain benign export.");
+    }
 
     if mode == "rules" {
         let raw_pcap = config
@@ -173,7 +314,7 @@ fn main() -> Result<()> {
                 let p = entry.path();
                 let ft = entry.file_type()?;
 
-                if ft.is_file() {
+                if ft.is_file() || ft.is_symlink() {
                     if p.extension().and_then(|s| s.to_str()) == Some("pcap") {
                         pos_files.push(p);
                     }
@@ -204,14 +345,7 @@ fn main() -> Result<()> {
             anyhow::bail!("No POS pcap files matched: {}", pos_input_str);
         }
 
-        let neg_pcap_path = Path::new(workspace_dir).join("BENIGM.pcap");
-        if let Err(e) = compact_pcap(&neg_glob, &neg_pcap_path) {
-            anyhow::bail!("Failed to compact NEG pcaps: {}", e)
-        }
-
-        if !neg_pcap_path.exists() {
-            anyhow::bail!("NEG pcap not found after compacting: {}", neg_pcap_path.display());
-        }
+        let neg_pcap_path = resolve_neg_pcap(config.global.shared_neg_pcap.as_deref(), neg_glob, workspace_dir)?;
 
         info!("🚀 Folder-mode Pipeline started. Workspace: {}", workspace_str);
         info!("🎲 NEG Sampling Rate: {:.2}%", sampling_rate * 100.0);

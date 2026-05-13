@@ -1,0 +1,11 @@
+{
+    "global": {
+        "mode": "folder",
+        "pos_glob": "data/smoke_ciciiot2025/pos",
+        "neg_glob": "data/smoke_ciciiot2025/neg",
+        "output_dir": "./data/experiments/smoke_ciciiot2025",
+        "neg_sampling_rate": 1.0,
+        "write_mixed_pcap": false
+    },
+    "attacks": []
+}
