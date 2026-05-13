@@ -1,0 +1,12 @@
+{
+  "global": {
+    "mode": "folder",
+    "pos_glob": "data/experiments/cic_apt_iiot2024_tactic_pos_full",
+    "neg_glob": "data/raw/CIC_APT_IIoT2024/downloaded_CICAPT_IIoT/CICAPT-IIoT Dataset/Network_Traffic/Phase1",
+    "shared_neg_pcap": "data/raw/CIC_APT_IIoT2024/downloaded_CICAPT_IIoT/CICAPT-IIoT Dataset/Network_Traffic/Phase1/1stPhase-timed-Merged.pcap",
+    "output_dir": "data/experiments/cic_apt_iiot2024_tactic_phase1_full",
+    "neg_sampling_rate": 1.0,
+    "write_mixed_pcap": false
+  },
+  "attacks": []
+}

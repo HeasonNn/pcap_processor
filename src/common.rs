@@ -19,6 +19,9 @@ pub struct GlobalConfig {
     // folder 模式
     pub pos_glob: Option<String>,
     pub neg_glob: Option<String>,
+    pub shared_neg_pcap: Option<String>,
+    pub pretrain_neg_glob: Option<String>,
+    pub shared_pretrain_neg_pcap: Option<String>,
 
     // rules 模式
     pub raw_pcap: Option<String>,
@@ -42,22 +45,64 @@ pub struct Rule {
     pub start_time: String,
     pub end_time: String,
     pub attack_type: String,
+    pub direction: Option<String>,
 }
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    #[arg(short, long)]
-    pub config: String,
+    #[command(subcommand)]
+    pub command: Command,
 }
 
+#[derive(Parser, Debug)]
+pub enum Command {
+    /// Process pcap files and generate dataset
+    Process {
+        #[arg(short, long)]
+        config: String,
+    },
+    /// Generate statistics from raw pcap files
+    Stats {
+        #[arg(short, long)]
+        config: String,
+        #[arg(short, long)]
+        output: String,
+    },
+    /// Build cached token shards for pretraining from a .data file
+    PretrainCache {
+        #[arg(long)]
+        data: String,
+        #[arg(long)]
+        out_dir: String,
+        #[arg(long, default_value_t = 20)]
+        packet_cutoff: usize,
+        #[arg(long, default_value_t = 60)]
+        flow_timeout_s: u64,
+        #[arg(long, default_value_t = 300)]
+        window_duration_s: u64,
+        #[arg(long, default_value_t = 2000)]
+        window_packet_limit: usize,
+        #[arg(long, default_value_t = 50000)]
+        shard_flows: usize,
+        #[arg(long, default_value_t = 0)]
+        max_flows: usize,
+        #[arg(long, default_value_t = 256)]
+        timeout_check_interval: usize,
+        #[arg(long, default_value_t = 5)]
+        graph_token_count: usize,
+    },
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RawPacket {
     pub src_ip: IpAddr,
     pub dst_ip: IpAddr,
     pub src_port: u16,
     pub dst_port: u16,
-    pub proto_code: u16,
+    pub protocol: u8,
+    pub packet_code: u16,
     pub ts_ns: i64,
     pub len: u16,
     pub label: bool,
@@ -125,6 +170,7 @@ pub struct PacketMeta {
     pub dst_ip: IpAddr,
     pub src_port: u16,
     pub dst_port: u16,
+    pub protocol: u8,
     pub packet_code: u16,
     pub ip_len: u16,
     pub ts_ns: i64,
@@ -137,6 +183,7 @@ impl PacketMeta {
         dst_ip: IpAddr,
         src_port: u16,
         dst_port: u16,
+        protocol: u8,
         packet_code: u16,
         ip_len: u16,
         ts_ns: i64,
@@ -146,6 +193,7 @@ impl PacketMeta {
             dst_ip: (dst_ip),
             src_port: (src_port),
             dst_port: (dst_port),
+            protocol: (protocol),
             packet_code: (packet_code),
             ip_len: (ip_len),
             ts_ns: (ts_ns),

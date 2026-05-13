@@ -1,0 +1,11 @@
+{
+    "global": {
+        "mode": "folder",
+        "pos_glob": "data/dohbrw/iodine/pos",
+        "neg_glob": "data/dohbrw/benign/all",
+        "output_dir": "./data/experiments/dohbrw_iodine",
+        "neg_sampling_rate": 1.0,
+        "write_mixed_pcap": false
+    },
+    "attacks": []
+}

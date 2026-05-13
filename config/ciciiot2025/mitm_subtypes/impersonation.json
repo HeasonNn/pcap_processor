@@ -1,0 +1,12 @@
+{
+    "global": {
+        "mode": "folder",
+        "pos_glob": "data/ciciiot2025/mitm_subtypes/impersonation",
+        "neg_glob": "data/raw/CICIIoT2025/benign_data",
+        "shared_neg_pcap": "data/shared_neg/CICIIOT2025_BENIGM.pcap",
+        "output_dir": "./data/experiments/ciciiot2025_mitm_subtypes/impersonation",
+        "neg_sampling_rate": 1.0,
+        "write_mixed_pcap": true
+    },
+    "attacks": []
+}

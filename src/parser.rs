@@ -209,6 +209,7 @@ pub fn parse_packet(packet: &Packet, link_type: Linktype) -> Option<PacketMeta> 
         dst_ip,
         src_port,
         dst_port,
+        protocol: next_proto,
         packet_code,
         ip_len: packet_length,
         ts_ns: (packet.header.ts.tv_sec as i64) * 1_000_000_000 + (packet.header.ts.tv_usec as i64) * 1_000,
@@ -378,17 +379,8 @@ pub fn filter_malicious_pkt(
             if let Some(meta) = parse_packet(&packet, link_type) {
                 let ts_f64 = meta.ts_ns as f64 / 1e9;
 
-                if let Some(rules) = index.get(&meta.src_ip) {
-                    if let Some((_, _, t)) = rules.iter().find(|(s, e, _)| ts_f64 >= *s && ts_f64 <= *e) {
-                        target_type = t;
-                    }
-                }
-                if target_type == "BENIGN" {
-                    if let Some(rules) = index.get(&meta.dst_ip) {
-                        if let Some((_, _, t)) = rules.iter().find(|(s, e, _)| ts_f64 >= *s && ts_f64 <= *e) {
-                            target_type = t;
-                        }
-                    }
+                if let Some(t) = match_rule(&index, &meta, ts_f64) {
+                    target_type = t;
                 }
             }
 
@@ -423,23 +415,57 @@ pub fn filter_malicious_pkt(
     Ok(generated_paths)
 }
 
-fn build_ip_index(rules: &Vec<Rule>) -> Result<HashMap<IpAddr, Vec<(f64, f64, String)>>> {
+fn build_ip_index(rules: &Vec<Rule>) -> Result<HashMap<IpAddr, Vec<(f64, f64, String, String)>>> {
     let mut index = HashMap::new();
     for r in rules {
         let s = parse_time(&r.start_time)?;
         let e = parse_time(&r.end_time)?;
+        let direction = r
+            .direction
+            .clone()
+            .unwrap_or_else(|| "either".to_string())
+            .to_lowercase();
+        if !matches!(direction.as_str(), "src" | "dst" | "either") {
+            anyhow::bail!("Invalid rule direction '{}': expected src, dst, or either", direction);
+        }
         for ip_str in &r.attackers {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 index
                     .entry(ip)
                     .or_insert_with(Vec::new)
-                    .push((s, e, r.attack_type.clone()));
+                    .push((s, e, r.attack_type.clone(), direction.clone()));
             } else {
                 warn!("Invalid IP: {}", ip_str);
             }
         }
     }
     Ok(index)
+}
+
+fn match_rule<'a>(
+    index: &'a HashMap<IpAddr, Vec<(f64, f64, String, String)>>,
+    meta: &PacketMeta,
+    ts_f64: f64,
+) -> Option<&'a str> {
+    if let Some(rules) = index.get(&meta.src_ip) {
+        if let Some((_, _, t, _)) = rules
+            .iter()
+            .find(|(s, e, _, direction)| ts_f64 >= *s && ts_f64 <= *e && (direction == "src" || direction == "either"))
+        {
+            return Some(t.as_str());
+        }
+    }
+
+    if let Some(rules) = index.get(&meta.dst_ip) {
+        if let Some((_, _, t, _)) = rules
+            .iter()
+            .find(|(s, e, _, direction)| ts_f64 >= *s && ts_f64 <= *e && (direction == "dst" || direction == "either"))
+        {
+            return Some(t.as_str());
+        }
+    }
+
+    None
 }
 
 fn parse_time(s: &str) -> Result<f64> {
