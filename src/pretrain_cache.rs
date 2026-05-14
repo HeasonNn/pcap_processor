@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::common::{FlowKey, RawPacket};
 
@@ -220,27 +220,107 @@ fn resolve_manifest_families(manifest: &PretrainManifest) -> Result<Vec<Resolved
         bail!("pretrain manifest must include at least one family");
     }
 
-    let root = Path::new(&manifest.root);
-    manifest
-        .families
-        .iter()
-        .map(|family| {
-            let data_path = root.join(&family.data);
-            if !data_path.exists() {
+    let root = Path::new(&manifest.root)
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize pretrain manifest root: {}", manifest.root))?;
+    let mut seen_families = HashSet::with_capacity(manifest.families.len());
+    let mut resolved: Vec<ResolvedPretrainManifestFamily> = Vec::with_capacity(manifest.families.len());
+
+    for family in &manifest.families {
+        if !seen_families.insert(family.family.as_str()) {
+            bail!("duplicate pretrain manifest family '{}'", family.family);
+        }
+
+        let data_path = resolve_manifest_relative_path(&root, &family.family, "data", &family.data)?;
+        if !data_path.exists() {
+            bail!(
+                "pretrain manifest family '{}' data file does not exist: {}",
+                family.family,
+                data_path.display()
+            );
+        }
+        let data_path = data_path.canonicalize().with_context(|| {
+            format!(
+                "Failed to canonicalize pretrain manifest family '{}' data path",
+                family.family
+            )
+        })?;
+        ensure_manifest_path_under_root(&root, &family.family, "data", &data_path)?;
+
+        let cache_path = resolve_manifest_relative_path(&root, &family.family, "cache", &family.cache)?;
+        for existing in &resolved {
+            if cache_path == existing.cache_path {
                 bail!(
-                    "pretrain manifest family '{}' data file does not exist: {}",
+                    "duplicate pretrain manifest cache path for family '{}': {} matches family '{}' cache",
                     family.family,
-                    data_path.display()
+                    cache_path.display(),
+                    existing.family
                 );
             }
+            if cache_path.starts_with(&existing.cache_path) || existing.cache_path.starts_with(&cache_path) {
+                bail!(
+                    "overlapping pretrain manifest cache path for family '{}': {} overlaps family '{}' cache {}",
+                    family.family,
+                    cache_path.display(),
+                    existing.family,
+                    existing.cache_path.display()
+                );
+            }
+        }
 
-            Ok(ResolvedPretrainManifestFamily {
-                family: family.family.clone(),
-                data_path,
-                cache_path: root.join(&family.cache),
-            })
-        })
-        .collect()
+        resolved.push(ResolvedPretrainManifestFamily {
+            family: family.family.clone(),
+            data_path,
+            cache_path,
+        });
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_manifest_relative_path(root: &Path, family: &str, field: &str, value: &str) -> Result<PathBuf> {
+    if value.is_empty() {
+        bail!("pretrain manifest family '{family}' {field} path must not be empty");
+    }
+
+    let path = Path::new(value);
+    if path.is_absolute() {
+        bail!("pretrain manifest family '{family}' {field} path must be relative: {value}");
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {},
+            Component::ParentDir => {
+                bail!("pretrain manifest family '{family}' {field} path must not contain '..': {value}");
+            },
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("pretrain manifest family '{family}' {field} path must be relative: {value}");
+            },
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        bail!("pretrain manifest family '{family}' {field} path must not be empty");
+    }
+
+    let resolved = root.join(normalized);
+    ensure_manifest_path_under_root(root, family, field, &resolved)?;
+    Ok(resolved)
+}
+
+fn ensure_manifest_path_under_root(root: &Path, family: &str, field: &str, path: &Path) -> Result<()> {
+    if !path.starts_with(root) {
+        bail!(
+            "pretrain manifest family '{}' {} path resolves outside manifest root: {}",
+            family,
+            field,
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 struct ShardWriter {
@@ -663,7 +743,23 @@ pub fn run_manifest(
 mod tests {
     use super::{load_and_resolve_manifest, resolve_manifest_families};
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
+
+    fn manifest_family(family: &str, data: &str, cache: &str) -> super::PretrainManifestFamily {
+        super::PretrainManifestFamily {
+            family: family.to_string(),
+            data: data.to_string(),
+            cache: cache.to_string(),
+        }
+    }
+
+    fn manifest(root: &Path, families: Vec<super::PretrainManifestFamily>) -> super::PretrainManifest {
+        super::PretrainManifest {
+            root: root.to_string_lossy().to_string(),
+            families,
+        }
+    }
 
     #[test]
     fn resolves_manifest_family_paths_relative_to_root() {
@@ -673,14 +769,10 @@ mod tests {
         fs::create_dir_all(&family_dir).unwrap();
         fs::write(family_dir.join("benign.data"), b"packet data").unwrap();
 
-        let manifest = super::PretrainManifest {
-            root: root.to_string_lossy().to_string(),
-            families: vec![super::PretrainManifestFamily {
-                family: "dohbrw".to_string(),
-                data: "dohbrw/benign.data".to_string(),
-                cache: "dohbrw/cache".to_string(),
-            }],
-        };
+        let manifest = manifest(
+            &root,
+            vec![manifest_family("dohbrw", "dohbrw/benign.data", "dohbrw/cache")],
+        );
 
         let resolved = resolve_manifest_families(&manifest).unwrap();
 
@@ -693,10 +785,7 @@ mod tests {
     #[test]
     fn manifest_resolution_rejects_empty_family_list() {
         let dir = tempdir().unwrap();
-        let manifest = super::PretrainManifest {
-            root: dir.path().to_string_lossy().to_string(),
-            families: vec![],
-        };
+        let manifest = manifest(dir.path(), vec![]);
 
         let err = resolve_manifest_families(&manifest).unwrap_err();
 
@@ -706,14 +795,10 @@ mod tests {
     #[test]
     fn manifest_resolution_rejects_missing_data_file() {
         let dir = tempdir().unwrap();
-        let manifest = super::PretrainManifest {
-            root: dir.path().to_string_lossy().to_string(),
-            families: vec![super::PretrainManifestFamily {
-                family: "missing".to_string(),
-                data: "missing/benign.data".to_string(),
-                cache: "missing/cache".to_string(),
-            }],
-        };
+        let manifest = manifest(
+            dir.path(),
+            vec![manifest_family("missing", "missing/benign.data", "missing/cache")],
+        );
 
         let err = resolve_manifest_families(&manifest).unwrap_err();
 
@@ -735,5 +820,125 @@ mod tests {
 
         assert!(message.contains("Failed to parse pretrain manifest JSON"));
         assert!(message.contains(&manifest_path.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_absolute_data_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        fs::create_dir_all(&root).unwrap();
+        let data = dir.path().join("outside.data");
+        fs::write(&data, b"packet data").unwrap();
+
+        let manifest = manifest(
+            &root,
+            vec![manifest_family("dohbrw", &data.to_string_lossy(), "dohbrw/cache")],
+        );
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert!(err.to_string().contains("data path must be relative"));
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_absolute_cache_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        let family_dir = root.join("dohbrw");
+        fs::create_dir_all(&family_dir).unwrap();
+        fs::write(family_dir.join("benign.data"), b"packet data").unwrap();
+
+        let manifest = manifest(
+            &root,
+            vec![manifest_family(
+                "dohbrw",
+                "dohbrw/benign.data",
+                &dir.path().join("cache").to_string_lossy(),
+            )],
+        );
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert!(err.to_string().contains("cache path must be relative"));
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_parent_dir_data_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(dir.path().join("outside.data"), b"packet data").unwrap();
+
+        let manifest = manifest(
+            &root,
+            vec![manifest_family("dohbrw", "../outside.data", "dohbrw/cache")],
+        );
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert!(err.to_string().contains("data path must not contain '..'"));
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_parent_dir_cache_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        let family_dir = root.join("dohbrw");
+        fs::create_dir_all(&family_dir).unwrap();
+        fs::write(family_dir.join("benign.data"), b"packet data").unwrap();
+
+        let manifest = manifest(&root, vec![manifest_family("dohbrw", "dohbrw/benign.data", "../cache")]);
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert!(err.to_string().contains("cache path must not contain '..'"));
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_duplicate_family_names() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        fs::write(first_dir.join("benign.data"), b"packet data").unwrap();
+        fs::write(second_dir.join("benign.data"), b"packet data").unwrap();
+
+        let manifest = manifest(
+            &root,
+            vec![
+                manifest_family("dup", "first/benign.data", "first/cache"),
+                manifest_family("dup", "second/benign.data", "second/cache"),
+            ],
+        );
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert_eq!(err.to_string(), "duplicate pretrain manifest family 'dup'");
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_duplicate_cache_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        fs::write(first_dir.join("benign.data"), b"packet data").unwrap();
+        fs::write(second_dir.join("benign.data"), b"packet data").unwrap();
+
+        let manifest = manifest(
+            &root,
+            vec![
+                manifest_family("first", "first/benign.data", "shared/cache"),
+                manifest_family("second", "second/benign.data", "shared/./cache"),
+            ],
+        );
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert!(err.to_string().contains("duplicate pretrain manifest cache path"));
     }
 }
