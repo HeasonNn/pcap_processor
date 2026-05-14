@@ -26,6 +26,23 @@ cargo run -- pretrain-cache \
   --window-packet-limit 2000
 ```
 
+Build dataset-level pretraining families:
+
+```bash
+cargo run --release -- process --config config/pretrain/families.json
+cargo run --release -- pretrain-cache \
+  --manifest data/pretrain_family/pretrain/manifest.json \
+  --window-packet-limit 2000 \
+  --shard-flows 50000
+```
+
+This pretrain-only config exports each family under
+`data/pretrain_family/pretrain/<family>/` with `benign.data`, `benign.csv`, and a
+family `cache/` directory. The manifest at
+`data/pretrain_family/pretrain/manifest.json` is the entry point for cache
+generation, and `data/pretrain_family/pretrain/` is the high-level staging path
+for Hugging Face upload.
+
 ## Development
 
 ```bash

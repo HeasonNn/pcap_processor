@@ -1,0 +1,22 @@
+{
+  "global": {
+    "mode": "folder",
+    "output_dir": "data/pretrain_family",
+    "neg_sampling_rate": 1.0,
+    "pretrain_families": [
+      {
+        "family": "ciciiot2025",
+        "shared_pcap": "data/shared_neg/CICIIOT2025_BENIGN.pcap"
+      },
+      {
+        "family": "dohbrw",
+        "glob": "data/dohbrw/benign/all"
+      },
+      {
+        "family": "cic_apt_iiot2024",
+        "shared_pcap": "data/raw/CIC_APT_IIoT2024/downloaded_CICAPT_IIoT/CICAPT-IIoT Dataset/Network_Traffic/Phase1/1stPhase-timed-Merged.pcap"
+      }
+    ]
+  },
+  "attacks": []
+}
