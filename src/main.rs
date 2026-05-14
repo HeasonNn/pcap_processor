@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info, warn};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -97,7 +98,7 @@ mod tests {
 
     #[test]
     fn pretrain_manifest_family_uses_relative_family_paths() {
-        let entry = build_pretrain_manifest_family("ciciiot2025", "data/shared_neg/CICIIOT2025_BENIGN.pcap");
+        let entry = build_pretrain_manifest_family("ciciiot2025", "data/shared_neg/CICIIOT2025_BENIGN.pcap").unwrap();
 
         assert_eq!(entry.family, "ciciiot2025");
         assert_eq!(entry.source, "data/shared_neg/CICIIOT2025_BENIGN.pcap");
@@ -109,20 +110,85 @@ mod tests {
     #[test]
     fn pretrain_manifest_serializes_root_and_families() {
         let root = unique_dir("pretrain_manifest_root").join("pretrain");
+        fs::create_dir_all(&root).unwrap();
         let manifest = build_pretrain_manifest(
             &root,
-            vec![build_pretrain_manifest_family("dohbrw", "dohbrw/BENIGN.pcap")],
-        );
+            vec![build_pretrain_manifest_family("dohbrw", "dohbrw/BENIGN.pcap").unwrap()],
+        )
+        .unwrap();
 
         let json = serde_json::to_value(&manifest).unwrap();
 
         assert_eq!(json["version"], 1);
-        assert_eq!(json["root"], root.to_string_lossy().as_ref());
+        assert_eq!(json["root"], root.canonicalize().unwrap().to_string_lossy().as_ref());
         assert_eq!(json["families"][0]["family"], "dohbrw");
         assert_eq!(json["families"][0]["source"], "dohbrw/BENIGN.pcap");
         assert_eq!(json["families"][0]["data"], "dohbrw/benign.data");
         assert_eq!(json["families"][0]["csv"], "dohbrw/benign.csv");
         assert_eq!(json["families"][0]["cache"], "dohbrw/cache");
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn pretrain_manifest_serializes_relative_root_as_absolute() {
+        let relative_root = PathBuf::from("target")
+            .join(format!(
+                "pcap_processor_relative_pretrain_root_{}",
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            ))
+            .join("pretrain");
+        fs::create_dir_all(&relative_root).unwrap();
+
+        let manifest = build_pretrain_manifest(&relative_root, vec![]).unwrap();
+
+        assert!(PathBuf::from(&manifest.root).is_absolute());
+        assert_eq!(manifest.root, relative_root.canonicalize().unwrap().to_string_lossy());
+
+        let _ = fs::remove_dir_all(relative_root.parent().unwrap());
+    }
+
+    #[test]
+    fn invalid_pretrain_family_names_are_rejected() {
+        for family in [
+            "",
+            ".",
+            "..",
+            "bad/name",
+            r"bad\name",
+            "bad.name",
+            "bad name",
+            "bad\tname",
+            "é",
+        ] {
+            let err = super::validate_pretrain_family_name(family).unwrap_err();
+
+            assert!(
+                err.to_string().contains("invalid pretrain family name")
+                    || err.to_string().contains("must not be empty"),
+                "unexpected error for {family:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_pretrain_family_names_are_rejected() {
+        let families = vec![
+            PretrainFamilyConfig {
+                family: "dup".to_string(),
+                glob: Some("first".to_string()),
+                shared_pcap: None,
+            },
+            PretrainFamilyConfig {
+                family: "dup".to_string(),
+                glob: Some("second".to_string()),
+                shared_pcap: None,
+            },
+        ];
+
+        let err = super::validate_pretrain_families(&families).unwrap_err();
+
+        assert_eq!(err.to_string(), "duplicate pretrain family 'dup'");
     }
 
     #[test]
@@ -205,22 +271,65 @@ fn pretrain_family_relative_path(family: &str, name: &str) -> String {
     format!("{family}/{name}")
 }
 
-fn build_pretrain_manifest_family(family: &str, source: impl Into<String>) -> PretrainManifestFamily {
-    PretrainManifestFamily {
+fn validate_pretrain_family_name(family: &str) -> Result<()> {
+    if family.is_empty() {
+        anyhow::bail!("pretrain family name must not be empty");
+    }
+    if family == "." || family == ".." {
+        anyhow::bail!(
+            "invalid pretrain family name '{}': '.' and '..' are not allowed",
+            family
+        );
+    }
+    if !family
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!(
+            "invalid pretrain family name '{}': use a single path component with only ASCII letters, digits, '_' or '-'",
+            family
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_pretrain_families(families: &[PretrainFamilyConfig]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(families.len());
+    for family in families {
+        validate_pretrain_family_name(&family.family)?;
+        if !seen.insert(family.family.as_str()) {
+            anyhow::bail!("duplicate pretrain family '{}'", family.family);
+        }
+    }
+
+    Ok(())
+}
+
+fn build_pretrain_manifest_family(family: &str, source: impl Into<String>) -> Result<PretrainManifestFamily> {
+    validate_pretrain_family_name(family)?;
+    Ok(PretrainManifestFamily {
         family: family.to_string(),
         source: source.into(),
         data: pretrain_family_relative_path(family, "benign.data"),
         csv: pretrain_family_relative_path(family, "benign.csv"),
         cache: pretrain_family_relative_path(family, "cache"),
-    }
+    })
 }
 
-fn build_pretrain_manifest(root: impl AsRef<Path>, families: Vec<PretrainManifestFamily>) -> PretrainManifest {
-    PretrainManifest {
+fn canonicalize_pretrain_root(root: impl AsRef<Path>) -> Result<PathBuf> {
+    let root = root.as_ref();
+    root.canonicalize()
+        .with_context(|| format!("Failed to canonicalize pretrain root: {}", root.display()))
+}
+
+fn build_pretrain_manifest(root: impl AsRef<Path>, families: Vec<PretrainManifestFamily>) -> Result<PretrainManifest> {
+    let root = canonicalize_pretrain_root(root)?;
+    Ok(PretrainManifest {
         version: 1,
-        root: root.as_ref().to_string_lossy().to_string(),
+        root: root.to_string_lossy().to_string(),
         families,
-    }
+    })
 }
 
 fn resolve_pretrain_neg_pcap(config: &Config, workspace_dir: impl AsRef<Path>) -> Result<Option<PathBuf>> {
@@ -300,6 +409,7 @@ fn run_pretrain_family_export(
     pretrain_root: impl AsRef<Path>,
     family: &PretrainFamilyConfig,
 ) -> Result<PretrainManifestFamily> {
+    validate_pretrain_family_name(&family.family)?;
     let family_dir = pretrain_root.as_ref().join(&family.family);
     ensure_dir(&family_dir)?;
 
@@ -327,19 +437,20 @@ fn run_pretrain_family_export(
         .with_context(|| format!("Pretrain family '{}' flow CSV generation failed", family.family))?;
     info!("✅ Pretrain family '{}' flow CSV generated", family.family);
 
-    Ok(build_pretrain_manifest_family(&family.family, manifest_source))
+    build_pretrain_manifest_family(&family.family, manifest_source)
 }
 
 fn run_pretrain_family_exports(workspace_dir: impl AsRef<Path>, families: &[PretrainFamilyConfig]) -> Result<()> {
     let pretrain_root = workspace_dir.as_ref().join("pretrain");
     ensure_dir(&pretrain_root)?;
+    validate_pretrain_families(families)?;
 
     let mut manifest_families = Vec::with_capacity(families.len());
     for family in families {
         manifest_families.push(run_pretrain_family_export(&pretrain_root, family)?);
     }
 
-    let manifest = build_pretrain_manifest(&pretrain_root, manifest_families);
+    let manifest = build_pretrain_manifest(&pretrain_root, manifest_families)?;
     let manifest_path = pretrain_root.join("manifest.json");
     let manifest_file = File::create(&manifest_path)
         .with_context(|| format!("Failed to create pretrain manifest: {}", manifest_path.display()))?;
