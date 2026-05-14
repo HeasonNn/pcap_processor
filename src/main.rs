@@ -148,6 +148,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_pretrain_family_pcap_fails_when_configured_shared_file_is_missing() {
+        let workspace = unique_dir("pretrain_family_missing_shared");
+        let family_dir = workspace.join("pretrain").join("dohbrw");
+        let glob_dir = workspace.join("glob");
+        fs::create_dir_all(&glob_dir).unwrap();
+
+        let family = PretrainFamilyConfig {
+            family: "dohbrw".to_string(),
+            glob: Some(glob_dir.to_string_lossy().to_string()),
+            shared_pcap: Some(workspace.join("missing.pcap").to_string_lossy().to_string()),
+        };
+
+        let err = super::resolve_pretrain_family_pcap(&family, &family_dir).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("Shared pretrain pcap not found for family 'dohbrw':")
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
     fn resolve_pretrain_family_pcap_requires_shared_pcap_or_glob() {
         let family_dir = unique_dir("pretrain_family_missing_source");
         let family = PretrainFamilyConfig {
@@ -224,21 +247,14 @@ fn resolve_pretrain_family_pcap(
 ) -> Result<(PathBuf, String)> {
     if let Some(shared_path) = family.shared_pcap.as_deref() {
         let resolved = PathBuf::from(shared_path);
-        if resolved.exists() {
-            return Ok((resolved, shared_path.to_string()));
-        }
-        if family.glob.is_none() {
+        if !resolved.exists() {
             anyhow::bail!(
                 "Shared pretrain pcap not found for family '{}': {}",
                 family.family,
                 resolved.display()
             );
         }
-        warn!(
-            "Shared pretrain pcap not found for family '{}': {}; compacting glob instead",
-            family.family,
-            resolved.display()
-        );
+        return Ok((resolved, shared_path.to_string()));
     }
 
     if let Some(pretrain_glob) = family.glob.as_deref() {
