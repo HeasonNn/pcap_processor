@@ -4,7 +4,7 @@ use glob::glob;
 use log::{info, warn};
 use pcap::{Capture, Linktype, Packet, Savefile};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -470,7 +470,7 @@ fn compact_zip_file(
         }
 
         let display_name = format!("{}:{}", zip_path.display(), member.name);
-        compact_capture_file(
+        let compact_result = compact_capture_file(
             &extracted_path,
             &display_name,
             writer,
@@ -479,7 +479,15 @@ fn compact_zip_file(
             total,
             source_index,
             source_count,
-        )?;
+        );
+        if let Err(err) = fs::remove_file(&extracted_path) {
+            warn!(
+                "Failed to remove temporary zip member file {}: {}",
+                extracted_path.display(),
+                err
+            );
+        }
+        compact_result?;
     }
 
     Ok(())
