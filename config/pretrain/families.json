@@ -15,6 +15,14 @@
       {
         "family": "cic_apt_iiot2024",
         "shared_pcap": "data/raw/CIC_APT_IIoT2024/downloaded_CICAPT_IIoT/CICAPT-IIoT Dataset/Network_Traffic/Phase1/1stPhase-timed-Merged.pcap"
+      },
+      {
+        "family": "unsw",
+        "glob": "data/raw/unsw/*/*.pcap"
+      },
+      {
+        "family": "ids2017",
+        "glob": "data/raw/CICIDS2017/**/*.pcap"
       }
     ]
   },

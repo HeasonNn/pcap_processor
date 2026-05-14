@@ -368,8 +368,16 @@ fn resolve_pretrain_family_pcap(
 
     if let Some(pretrain_glob) = family.glob.as_deref() {
         let family_pcap_path = family_dir.as_ref().join("BENIGN.pcap");
-        compact_pcap(pretrain_glob, &family_pcap_path)
-            .with_context(|| format!("Failed to compact pretrain pcaps for family '{}'", family.family))?;
+        if family_pcap_path.exists() {
+            info!(
+                "Pretrain family '{}' compacted pcap already exists, reusing {}",
+                family.family,
+                family_pcap_path.display()
+            );
+        } else {
+            compact_pcap(pretrain_glob, &family_pcap_path)
+                .with_context(|| format!("Failed to compact pretrain pcaps for family '{}'", family.family))?;
+        }
         if !family_pcap_path.exists() {
             anyhow::bail!(
                 "Pretrain pcap not found after compacting family '{}': {}",
@@ -417,25 +425,39 @@ fn run_pretrain_family_export(
     let prefix_path = family_dir.join("benign");
     let prefix_str = prefix_path.to_string_lossy().to_string();
     let benign_pcap_str = benign_pcap_path.to_string_lossy().to_string();
-
-    info!(
-        "Pretrain family export [{}]: {} -> {}",
-        family.family, benign_pcap_str, prefix_str
-    );
-    let count = merger::export_benign_dataset(&benign_pcap_str, &prefix_str, false)
-        .with_context(|| format!("Failed to export pretrain family '{}'", family.family))?;
-    info!(
-        "✅ Pretrain family '{}' .data generated. Total packets: {}",
-        family.family, count
-    );
-
     let data_file = format!("{}.data", prefix_str);
     let csv_path = format!("{}.csv", prefix_str);
-    let engine = flow::FlowEngine::new(5_000_000);
-    engine
-        .run_benign(&data_file, &csv_path)
-        .with_context(|| format!("Pretrain family '{}' flow CSV generation failed", family.family))?;
-    info!("✅ Pretrain family '{}' flow CSV generated", family.family);
+
+    if Path::new(&data_file).exists() {
+        info!(
+            "Pretrain family '{}' .data already exists, reusing {}",
+            family.family, data_file
+        );
+    } else {
+        info!(
+            "Pretrain family export [{}]: {} -> {}",
+            family.family, benign_pcap_str, prefix_str
+        );
+        let count = merger::export_benign_dataset(&benign_pcap_str, &prefix_str, false)
+            .with_context(|| format!("Failed to export pretrain family '{}'", family.family))?;
+        info!(
+            "✅ Pretrain family '{}' .data generated. Total packets: {}",
+            family.family, count
+        );
+    }
+
+    if Path::new(&csv_path).exists() {
+        info!(
+            "Pretrain family '{}' flow CSV already exists, reusing {}",
+            family.family, csv_path
+        );
+    } else {
+        let engine = flow::FlowEngine::new(5_000_000);
+        engine
+            .run_benign(&data_file, &csv_path)
+            .with_context(|| format!("Pretrain family '{}' flow CSV generation failed", family.family))?;
+        info!("✅ Pretrain family '{}' flow CSV generated", family.family);
+    }
 
     build_pretrain_manifest_family(&family.family, manifest_source)
 }
