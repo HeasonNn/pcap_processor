@@ -523,17 +523,20 @@ fn main() -> Result<()> {
             timeout_check_interval,
             graph_token_count,
             manifest,
-        } => {
-            if manifest.is_some() {
-                anyhow::bail!("pretrain-cache --manifest is not implemented yet");
-            }
-            let data = data
-                .as_deref()
-                .context("pretrain-cache requires --data in single-file mode")?;
-            let out_dir = out_dir
-                .as_deref()
-                .context("pretrain-cache requires --out-dir in single-file mode")?;
-            pretrain_cache::run(
+        } => match (manifest.as_deref(), data.as_deref(), out_dir.as_deref()) {
+            (Some(manifest), None, None) => pretrain_cache::run_manifest(
+                manifest,
+                packet_cutoff,
+                flow_timeout_s,
+                window_duration_s,
+                window_packet_limit,
+                shard_flows,
+                max_flows,
+                timeout_check_interval,
+                graph_token_count,
+            ),
+            (Some(_), _, _) => anyhow::bail!("pretrain-cache --manifest cannot be combined with --data or --out-dir"),
+            (None, Some(data), Some(out_dir)) => pretrain_cache::run(
                 data,
                 out_dir,
                 packet_cutoff,
@@ -544,7 +547,9 @@ fn main() -> Result<()> {
                 max_flows,
                 timeout_check_interval,
                 graph_token_count,
-            )
+            ),
+            (None, None, _) => anyhow::bail!("pretrain-cache requires --data in single-file mode"),
+            (None, _, None) => anyhow::bail!("pretrain-cache requires --out-dir in single-file mode"),
         },
     }
 }

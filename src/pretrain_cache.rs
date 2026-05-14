@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use ndarray::{Array2, Array3};
 use ndarray_npy::NpzWriter;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::common::{FlowKey, RawPacket};
 
@@ -183,6 +183,64 @@ struct Metadata {
     total_flows: usize,
     packet_cutoff: usize,
     graph_token_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PretrainManifest {
+    root: String,
+    families: Vec<PretrainManifestFamily>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PretrainManifestFamily {
+    family: String,
+    data: String,
+    cache: String,
+}
+
+#[derive(Debug)]
+struct ResolvedPretrainManifestFamily {
+    family: String,
+    data_path: PathBuf,
+    cache_path: PathBuf,
+}
+
+fn load_and_resolve_manifest(manifest_path: impl AsRef<Path>) -> Result<Vec<ResolvedPretrainManifestFamily>> {
+    let manifest_path = manifest_path.as_ref();
+    let manifest_json = fs::read_to_string(manifest_path)
+        .with_context(|| format!("Failed to read pretrain manifest: {}", manifest_path.display()))?;
+    let manifest: PretrainManifest = serde_json::from_str(&manifest_json)
+        .with_context(|| format!("Failed to parse pretrain manifest JSON: {}", manifest_path.display()))?;
+
+    resolve_manifest_families(&manifest)
+}
+
+fn resolve_manifest_families(manifest: &PretrainManifest) -> Result<Vec<ResolvedPretrainManifestFamily>> {
+    if manifest.families.is_empty() {
+        bail!("pretrain manifest must include at least one family");
+    }
+
+    let root = Path::new(&manifest.root);
+    manifest
+        .families
+        .iter()
+        .map(|family| {
+            let data_path = root.join(&family.data);
+            if !data_path.exists() {
+                bail!(
+                    "pretrain manifest family '{}' data file does not exist: {}",
+                    family.family,
+                    data_path.display()
+                );
+            }
+
+            Ok(ResolvedPretrainManifestFamily {
+                family: family.family.clone(),
+                data_path,
+                cache_path: root.join(&family.cache),
+            })
+        })
+        .collect()
 }
 
 struct ShardWriter {
@@ -558,4 +616,124 @@ pub fn run(
     let metadata_path = Path::new(out_dir).join("metadata.json");
     serde_json::to_writer_pretty(File::create(metadata_path)?, &metadata)?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_manifest(
+    manifest_path: &str,
+    packet_cutoff: usize,
+    flow_timeout_s: u64,
+    window_duration_s: u64,
+    window_packet_limit: usize,
+    shard_flows: usize,
+    max_flows: usize,
+    timeout_check_interval: usize,
+    graph_token_count: usize,
+) -> Result<()> {
+    let families = load_and_resolve_manifest(manifest_path)?;
+
+    for family in families {
+        let data_path = family.data_path.to_string_lossy().to_string();
+        let cache_path = family.cache_path.to_string_lossy().to_string();
+        log::info!(
+            "Pretrain manifest family [{}]: data={} cache={}",
+            family.family,
+            data_path,
+            cache_path
+        );
+        run(
+            &data_path,
+            &cache_path,
+            packet_cutoff,
+            flow_timeout_s,
+            window_duration_s,
+            window_packet_limit,
+            shard_flows,
+            max_flows,
+            timeout_check_interval,
+            graph_token_count,
+        )
+        .with_context(|| format!("Failed to build pretrain cache for family '{}'", family.family))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_and_resolve_manifest, resolve_manifest_families};
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolves_manifest_family_paths_relative_to_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        let family_dir = root.join("dohbrw");
+        fs::create_dir_all(&family_dir).unwrap();
+        fs::write(family_dir.join("benign.data"), b"packet data").unwrap();
+
+        let manifest = super::PretrainManifest {
+            root: root.to_string_lossy().to_string(),
+            families: vec![super::PretrainManifestFamily {
+                family: "dohbrw".to_string(),
+                data: "dohbrw/benign.data".to_string(),
+                cache: "dohbrw/cache".to_string(),
+            }],
+        };
+
+        let resolved = resolve_manifest_families(&manifest).unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].family, "dohbrw");
+        assert_eq!(resolved[0].data_path, family_dir.join("benign.data"));
+        assert_eq!(resolved[0].cache_path, family_dir.join("cache"));
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_empty_family_list() {
+        let dir = tempdir().unwrap();
+        let manifest = super::PretrainManifest {
+            root: dir.path().to_string_lossy().to_string(),
+            families: vec![],
+        };
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert_eq!(err.to_string(), "pretrain manifest must include at least one family");
+    }
+
+    #[test]
+    fn manifest_resolution_rejects_missing_data_file() {
+        let dir = tempdir().unwrap();
+        let manifest = super::PretrainManifest {
+            root: dir.path().to_string_lossy().to_string(),
+            families: vec![super::PretrainManifestFamily {
+                family: "missing".to_string(),
+                data: "missing/benign.data".to_string(),
+                cache: "missing/cache".to_string(),
+            }],
+        };
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pretrain manifest family 'missing' data file does not exist")
+        );
+        assert!(err.to_string().contains("missing/benign.data"));
+    }
+
+    #[test]
+    fn load_manifest_reports_parse_path_context() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        fs::write(&manifest_path, b"{not json").unwrap();
+
+        let err = load_and_resolve_manifest(&manifest_path).unwrap_err();
+        let message = format!("{err:#}");
+
+        assert!(message.contains("Failed to parse pretrain manifest JSON"));
+        assert!(message.contains(&manifest_path.to_string_lossy().to_string()));
+    }
 }
