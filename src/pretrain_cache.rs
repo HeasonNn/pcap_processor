@@ -770,6 +770,15 @@ pub fn run_manifest(
     for family in families {
         let data_path = family.data_path.to_string_lossy().to_string();
         let cache_path = family.cache_path.to_string_lossy().to_string();
+        let metadata_path = family.cache_path.join("metadata.json");
+        if metadata_path.exists() {
+            log::info!(
+                "Pretrain manifest family [{}]: cache metadata already exists, reusing {}",
+                family.family,
+                cache_path
+            );
+            continue;
+        }
         log::info!(
             "Pretrain manifest family [{}]: data={} cache={}",
             family.family,
