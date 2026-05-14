@@ -6,11 +6,12 @@ mod parser;
 mod pretrain_cache;
 mod stats;
 
-use crate::common::{Args, Command, Config};
+use crate::common::{Args, Command, Config, PretrainFamilyConfig};
 use crate::parser::compact_pcap;
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info, warn};
+use serde::Serialize;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -44,7 +45,8 @@ fn resolve_neg_pcap(shared_neg_pcap: Option<&str>, neg_glob: &str, workspace_dir
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_neg_pcap;
+    use super::{build_pretrain_manifest, build_pretrain_manifest_family, resolve_neg_pcap};
+    use crate::common::PretrainFamilyConfig;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,6 +94,110 @@ mod tests {
         let parsed: crate::common::Config = serde_json::from_str(cfg).unwrap();
         assert!(parsed.global.shared_neg_pcap.is_none());
     }
+
+    #[test]
+    fn pretrain_manifest_family_uses_relative_family_paths() {
+        let entry = build_pretrain_manifest_family("ciciiot2025", "data/shared_neg/CICIIOT2025_BENIGN.pcap");
+
+        assert_eq!(entry.family, "ciciiot2025");
+        assert_eq!(entry.source, "data/shared_neg/CICIIOT2025_BENIGN.pcap");
+        assert_eq!(entry.data, "ciciiot2025/benign.data");
+        assert_eq!(entry.csv, "ciciiot2025/benign.csv");
+        assert_eq!(entry.cache, "ciciiot2025/cache");
+    }
+
+    #[test]
+    fn pretrain_manifest_serializes_root_and_families() {
+        let root = unique_dir("pretrain_manifest_root").join("pretrain");
+        let manifest = build_pretrain_manifest(
+            &root,
+            vec![build_pretrain_manifest_family("dohbrw", "dohbrw/BENIGN.pcap")],
+        );
+
+        let json = serde_json::to_value(&manifest).unwrap();
+
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["root"], root.to_string_lossy().as_ref());
+        assert_eq!(json["families"][0]["family"], "dohbrw");
+        assert_eq!(json["families"][0]["source"], "dohbrw/BENIGN.pcap");
+        assert_eq!(json["families"][0]["data"], "dohbrw/benign.data");
+        assert_eq!(json["families"][0]["csv"], "dohbrw/benign.csv");
+        assert_eq!(json["families"][0]["cache"], "dohbrw/cache");
+    }
+
+    #[test]
+    fn resolve_pretrain_family_pcap_prefers_existing_shared_file() {
+        let workspace = unique_dir("pretrain_family_shared");
+        let family_dir = workspace.join("pretrain").join("dohbrw");
+        fs::create_dir_all(&family_dir).unwrap();
+        let shared_pcap = workspace.join("shared.pcap");
+        fs::write(&shared_pcap, b"pcap").unwrap();
+
+        let family = PretrainFamilyConfig {
+            family: "dohbrw".to_string(),
+            glob: Some("unused".to_string()),
+            shared_pcap: Some(shared_pcap.to_string_lossy().to_string()),
+        };
+
+        let (resolved, source) = super::resolve_pretrain_family_pcap(&family, &family_dir).unwrap();
+
+        assert_eq!(resolved, shared_pcap);
+        assert_eq!(source, resolved.to_string_lossy());
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn resolve_pretrain_family_pcap_requires_shared_pcap_or_glob() {
+        let family_dir = unique_dir("pretrain_family_missing_source");
+        let family = PretrainFamilyConfig {
+            family: "ciciiot2025".to_string(),
+            glob: None,
+            shared_pcap: None,
+        };
+
+        let err = super::resolve_pretrain_family_pcap(&family, &family_dir).unwrap_err();
+
+        assert_eq!(err.to_string(), "family 'ciciiot2025' requires shared_pcap or glob");
+    }
+}
+
+#[derive(Serialize)]
+struct PretrainManifest {
+    version: u32,
+    root: String,
+    families: Vec<PretrainManifestFamily>,
+}
+
+#[derive(Serialize)]
+struct PretrainManifestFamily {
+    family: String,
+    source: String,
+    data: String,
+    csv: String,
+    cache: String,
+}
+
+fn pretrain_family_relative_path(family: &str, name: &str) -> String {
+    format!("{family}/{name}")
+}
+
+fn build_pretrain_manifest_family(family: &str, source: impl Into<String>) -> PretrainManifestFamily {
+    PretrainManifestFamily {
+        family: family.to_string(),
+        source: source.into(),
+        data: pretrain_family_relative_path(family, "benign.data"),
+        csv: pretrain_family_relative_path(family, "benign.csv"),
+        cache: pretrain_family_relative_path(family, "cache"),
+    }
+}
+
+fn build_pretrain_manifest(root: impl AsRef<Path>, families: Vec<PretrainManifestFamily>) -> PretrainManifest {
+    PretrainManifest {
+        version: 1,
+        root: root.as_ref().to_string_lossy().to_string(),
+        families,
+    }
 }
 
 fn resolve_pretrain_neg_pcap(config: &Config, workspace_dir: impl AsRef<Path>) -> Result<Option<PathBuf>> {
@@ -112,6 +218,49 @@ fn resolve_pretrain_neg_pcap(config: &Config, workspace_dir: impl AsRef<Path>) -
     Ok(None)
 }
 
+fn resolve_pretrain_family_pcap(
+    family: &PretrainFamilyConfig,
+    family_dir: impl AsRef<Path>,
+) -> Result<(PathBuf, String)> {
+    if let Some(shared_path) = family.shared_pcap.as_deref() {
+        let resolved = PathBuf::from(shared_path);
+        if resolved.exists() {
+            return Ok((resolved, shared_path.to_string()));
+        }
+        if family.glob.is_none() {
+            anyhow::bail!(
+                "Shared pretrain pcap not found for family '{}': {}",
+                family.family,
+                resolved.display()
+            );
+        }
+        warn!(
+            "Shared pretrain pcap not found for family '{}': {}; compacting glob instead",
+            family.family,
+            resolved.display()
+        );
+    }
+
+    if let Some(pretrain_glob) = family.glob.as_deref() {
+        let family_pcap_path = family_dir.as_ref().join("BENIGN.pcap");
+        compact_pcap(pretrain_glob, &family_pcap_path)
+            .with_context(|| format!("Failed to compact pretrain pcaps for family '{}'", family.family))?;
+        if !family_pcap_path.exists() {
+            anyhow::bail!(
+                "Pretrain pcap not found after compacting family '{}': {}",
+                family.family,
+                family_pcap_path.display()
+            );
+        }
+        return Ok((
+            family_pcap_path,
+            pretrain_family_relative_path(&family.family, "BENIGN.pcap"),
+        ));
+    }
+
+    anyhow::bail!("family '{}' requires shared_pcap or glob", family.family);
+}
+
 fn run_pretrain_benign_export(workspace_dir: impl AsRef<Path>, benign_pcap_path: impl AsRef<Path>) -> Result<()> {
     let prefix_path = workspace_dir.as_ref().join("pretrain_benign");
     let prefix_str = prefix_path.to_string_lossy().to_string();
@@ -128,6 +277,60 @@ fn run_pretrain_benign_export(workspace_dir: impl AsRef<Path>, benign_pcap_path:
         Ok(_) => info!("✅ Pretrain benign flow CSV generated"),
         Err(e) => error!("❌ Pretrain benign flow construction failed: {}", e),
     }
+    Ok(())
+}
+
+fn run_pretrain_family_export(
+    pretrain_root: impl AsRef<Path>,
+    family: &PretrainFamilyConfig,
+) -> Result<PretrainManifestFamily> {
+    let family_dir = pretrain_root.as_ref().join(&family.family);
+    ensure_dir(&family_dir)?;
+
+    let (benign_pcap_path, manifest_source) = resolve_pretrain_family_pcap(family, &family_dir)?;
+    let prefix_path = family_dir.join("benign");
+    let prefix_str = prefix_path.to_string_lossy().to_string();
+    let benign_pcap_str = benign_pcap_path.to_string_lossy().to_string();
+
+    info!(
+        "Pretrain family export [{}]: {} -> {}",
+        family.family, benign_pcap_str, prefix_str
+    );
+    let count = merger::export_benign_dataset(&benign_pcap_str, &prefix_str, false)
+        .with_context(|| format!("Failed to export pretrain family '{}'", family.family))?;
+    info!(
+        "✅ Pretrain family '{}' .data generated. Total packets: {}",
+        family.family, count
+    );
+
+    let data_file = format!("{}.data", prefix_str);
+    let csv_path = format!("{}.csv", prefix_str);
+    let engine = flow::FlowEngine::new(5_000_000);
+    engine
+        .run_benign(&data_file, &csv_path)
+        .with_context(|| format!("Pretrain family '{}' flow CSV generation failed", family.family))?;
+    info!("✅ Pretrain family '{}' flow CSV generated", family.family);
+
+    Ok(build_pretrain_manifest_family(&family.family, manifest_source))
+}
+
+fn run_pretrain_family_exports(workspace_dir: impl AsRef<Path>, families: &[PretrainFamilyConfig]) -> Result<()> {
+    let pretrain_root = workspace_dir.as_ref().join("pretrain");
+    ensure_dir(&pretrain_root)?;
+
+    let mut manifest_families = Vec::with_capacity(families.len());
+    for family in families {
+        manifest_families.push(run_pretrain_family_export(&pretrain_root, family)?);
+    }
+
+    let manifest = build_pretrain_manifest(&pretrain_root, manifest_families);
+    let manifest_path = pretrain_root.join("manifest.json");
+    let manifest_file = File::create(&manifest_path)
+        .with_context(|| format!("Failed to create pretrain manifest: {}", manifest_path.display()))?;
+    serde_json::to_writer_pretty(manifest_file, &manifest)
+        .with_context(|| format!("Failed to write pretrain manifest: {}", manifest_path.display()))?;
+    info!("Pretrain manifest written: {}", manifest_path.display());
+
     Ok(())
 }
 
@@ -192,18 +395,30 @@ fn main() -> Result<()> {
             max_flows,
             timeout_check_interval,
             graph_token_count,
-        } => pretrain_cache::run(
-            &data,
-            &out_dir,
-            packet_cutoff,
-            flow_timeout_s,
-            window_duration_s,
-            window_packet_limit,
-            shard_flows,
-            max_flows,
-            timeout_check_interval,
-            graph_token_count,
-        ),
+            manifest,
+        } => {
+            if manifest.is_some() {
+                anyhow::bail!("pretrain-cache --manifest is not implemented yet");
+            }
+            let data = data
+                .as_deref()
+                .context("pretrain-cache requires --data in single-file mode")?;
+            let out_dir = out_dir
+                .as_deref()
+                .context("pretrain-cache requires --out-dir in single-file mode")?;
+            pretrain_cache::run(
+                data,
+                out_dir,
+                packet_cutoff,
+                flow_timeout_s,
+                window_duration_s,
+                window_packet_limit,
+                shard_flows,
+                max_flows,
+                timeout_check_interval,
+                graph_token_count,
+            )
+        },
     }
 }
 
@@ -220,7 +435,18 @@ fn process_dataset(config_path: &str) -> Result<()> {
 
     ensure_dir(workspace_dir)?;
 
-    if let Some(pretrain_neg_pcap) = resolve_pretrain_neg_pcap(&config, workspace_dir)? {
+    if let Some(pretrain_families) = config
+        .global
+        .pretrain_families
+        .as_deref()
+        .filter(|families| !families.is_empty())
+    {
+        run_pretrain_family_exports(workspace_dir, pretrain_families)?;
+        if config.attacks.is_empty() {
+            info!("Pretrain families exported; no attacks configured, skipping scenario processing.");
+            return Ok(());
+        }
+    } else if let Some(pretrain_neg_pcap) = resolve_pretrain_neg_pcap(&config, workspace_dir)? {
         run_pretrain_benign_export(workspace_dir, &pretrain_neg_pcap)?;
     } else {
         info!("No pretrain_neg_glob/shared_pretrain_neg_pcap configured; skipping standalone pretrain benign export.");
