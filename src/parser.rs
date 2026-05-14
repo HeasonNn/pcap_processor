@@ -13,6 +13,10 @@ use zip::ZipArchive;
 
 use crate::common::{PacketMeta, PacketType, Rule};
 
+// DoHBrw raw PCAP members can be multi-GB. This guard is intentionally far above
+// normal dataset sizes and only skips absurd declared sizes that indicate zip-bomb risk.
+const MAX_ZIP_MEMBER_UNCOMPRESSED_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024; // 16 TiB
+
 fn decode_l2(data: &[u8], link_type: Linktype) -> Option<(usize, u16)> {
     match link_type {
         Linktype::ETHERNET => {
@@ -272,24 +276,14 @@ pub fn compact_pcap(input_path: impl AsRef<Path>, output_path: impl AsRef<Path>)
 #[derive(Debug)]
 enum CompactSource {
     File(PathBuf),
-    ZipMember {
-        zip_path: PathBuf,
-        member_name: String,
-        member_index: usize,
-    },
+    Zip(PathBuf),
 }
 
-impl CompactSource {
-    fn display_name(&self) -> String {
-        match self {
-            CompactSource::File(path) => path.display().to_string(),
-            CompactSource::ZipMember {
-                zip_path, member_name, ..
-            } => {
-                format!("{}:{}", zip_path.display(), member_name)
-            },
-        }
-    }
+#[derive(Debug)]
+struct ZipMemberSource {
+    index: usize,
+    name: String,
+    size: u64,
 }
 
 fn collect_compact_sources(input_path: &Path) -> Result<Vec<CompactSource>> {
@@ -301,13 +295,7 @@ fn collect_compact_sources(input_path: &Path) -> Result<Vec<CompactSource>> {
         if is_capture_file(&path) {
             sources.push(CompactSource::File(path));
         } else if is_zip_file(&path) {
-            for (member_name, member_index) in zip_capture_members(&path)? {
-                sources.push(CompactSource::ZipMember {
-                    zip_path: path.clone(),
-                    member_name,
-                    member_index,
-                });
-            }
+            sources.push(CompactSource::Zip(path));
         }
     }
 
@@ -344,24 +332,34 @@ fn collect_supported_paths(input_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn zip_capture_members(path: &Path) -> Result<Vec<(String, usize)>> {
-    let file = File::open(path).with_context(|| format!("Failed to open zip: {}", path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).with_context(|| format!("Failed to read zip archive: {}", path.display()))?;
+fn zip_capture_members(archive: &mut ZipArchive<File>, zip_path: &Path) -> Vec<ZipMemberSource> {
     let mut members = Vec::new();
 
     for i in 0..archive.len() {
-        let entry = archive
-            .by_index(i)
-            .with_context(|| format!("Failed to read zip entry {} from {}", i, path.display()))?;
-        let member_name = entry.name().to_string();
-        if !entry.is_dir() && is_capture_member_name(&member_name) {
-            members.push((member_name, i));
-        }
+        match archive.by_index(i) {
+            Ok(entry) => {
+                let member_name = entry.name().to_string();
+                if !entry.is_dir() && is_capture_member_name(&member_name) {
+                    members.push(ZipMemberSource {
+                        index: i,
+                        name: member_name,
+                        size: entry.size(),
+                    });
+                }
+            },
+            Err(err) => {
+                warn!(
+                    "Skipping unreadable zip entry {} from {}: {}",
+                    i,
+                    zip_path.display(),
+                    err
+                );
+            },
+        };
     }
-    members.sort_by(|(a, _), (b, _)| natord::compare(a, b));
+    members.sort_by(|a, b| natord::compare(&a.name, &b.name));
 
-    Ok(members)
+    members
 }
 
 fn is_supported_source_file(path: &Path) -> bool {
@@ -399,7 +397,7 @@ fn process_compact_source(
     match source {
         CompactSource::File(path) => compact_capture_file(
             path,
-            &source.display_name(),
+            &path.display().to_string(),
             writer,
             cursor_ns,
             gap_ns,
@@ -407,43 +405,99 @@ fn process_compact_source(
             source_index,
             source_count,
         ),
-        CompactSource::ZipMember {
-            zip_path,
-            member_name,
-            member_index,
-        } => {
-            let temp_dir = TempDir::new().context("Failed to create temp dir for zip extraction")?;
-            let ext = Path::new(member_name)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("pcap");
-            let extracted_path = temp_dir.path().join(format!("member.{}", ext));
-            extract_zip_member(zip_path, *member_index, member_name, &extracted_path)?;
-            compact_capture_file(
-                &extracted_path,
-                &source.display_name(),
-                writer,
-                cursor_ns,
-                gap_ns,
-                total,
-                source_index,
-                source_count,
-            )
+        CompactSource::Zip(path) => {
+            compact_zip_file(path, writer, cursor_ns, gap_ns, total, source_index, source_count)
         },
     }
 }
 
-fn extract_zip_member(zip_path: &Path, member_index: usize, member_name: &str, out_path: &Path) -> Result<()> {
-    let file = File::open(zip_path).with_context(|| format!("Failed to open zip: {}", zip_path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).with_context(|| format!("Failed to read zip archive: {}", zip_path.display()))?;
+fn compact_zip_file(
+    zip_path: &Path,
+    writer: &mut Savefile,
+    cursor_ns: &mut u64,
+    gap_ns: u64,
+    total: &mut u64,
+    source_index: usize,
+    source_count: usize,
+) -> Result<()> {
+    let file = match File::open(zip_path) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!("Skipping zip {}: failed to open: {}", zip_path.display(), err);
+            return Ok(());
+        },
+    };
+    let mut archive = match ZipArchive::new(file) {
+        Ok(archive) => archive,
+        Err(err) => {
+            warn!("Skipping zip {}: failed to read archive: {}", zip_path.display(), err);
+            return Ok(());
+        },
+    };
+
+    let members = zip_capture_members(&mut archive, zip_path);
+    if members.is_empty() {
+        warn!("Skipping zip {}: no pcap/pcapng members found", zip_path.display());
+        return Ok(());
+    }
+
+    let temp_dir = TempDir::new().context("Failed to create temp dir for zip extraction")?;
+    for member in members {
+        if member.size > MAX_ZIP_MEMBER_UNCOMPRESSED_SIZE {
+            warn!(
+                "Skipping zip member {}:{}: declared uncompressed size {} exceeds guard {}",
+                zip_path.display(),
+                member.name,
+                member.size,
+                MAX_ZIP_MEMBER_UNCOMPRESSED_SIZE
+            );
+            continue;
+        }
+
+        let ext = Path::new(&member.name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("pcap");
+        let extracted_path = temp_dir.path().join(format!("member_{}.{}", member.index, ext));
+        if let Err(err) = extract_zip_member(&mut archive, zip_path, &member, &extracted_path) {
+            warn!(
+                "Skipping zip member {}:{}: failed to extract: {}",
+                zip_path.display(),
+                member.name,
+                err
+            );
+            continue;
+        }
+
+        let display_name = format!("{}:{}", zip_path.display(), member.name);
+        compact_capture_file(
+            &extracted_path,
+            &display_name,
+            writer,
+            cursor_ns,
+            gap_ns,
+            total,
+            source_index,
+            source_count,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn extract_zip_member(
+    archive: &mut ZipArchive<File>,
+    zip_path: &Path,
+    member: &ZipMemberSource,
+    out_path: &Path,
+) -> Result<()> {
     let mut entry = archive
-        .by_index(member_index)
-        .with_context(|| format!("Failed to read zip entry {} from {}", member_index, zip_path.display()))?;
+        .by_index(member.index)
+        .with_context(|| format!("Failed to read zip entry {} from {}", member.index, zip_path.display()))?;
 
     let mut out =
         File::create(out_path).with_context(|| format!("Failed to create extracted file: {}", out_path.display()))?;
-    io::copy(&mut entry, &mut out).with_context(|| format!("Failed to extract zip entry {}", member_name))?;
+    io::copy(&mut entry, &mut out).with_context(|| format!("Failed to extract zip entry {}", member.name))?;
     Ok(())
 }
 
@@ -790,5 +844,49 @@ mod tests {
         let (linktype, packets) = output_packet_summary(&output);
         assert_eq!(linktype, Linktype::ETHERNET);
         assert_eq!(packets, vec![(0, 0, 7)]);
+    }
+
+    #[test]
+    fn compact_pcap_skips_corrupt_zip_matched_by_glob() {
+        let temp = tempdir().unwrap();
+        let valid = temp.path().join("valid.pcap");
+        write_test_pcap(&valid, 3, 10, 0);
+        fs::write(temp.path().join("bad.zip"), b"not a zip archive").unwrap();
+
+        let output = temp.path().join("out.pcap");
+        let pattern = temp.path().join("*").to_string_lossy().to_string();
+        compact_pcap(&pattern, &output).unwrap();
+
+        let (linktype, packets) = output_packet_summary(&output);
+        assert_eq!(linktype, Linktype::ETHERNET);
+        assert_eq!(packets, vec![(0, 0, 3)]);
+    }
+
+    #[test]
+    fn compact_pcap_processes_multiple_zip_members_in_natural_name_order() {
+        let temp = tempdir().unwrap();
+        let member10 = temp.path().join("member10.pcap");
+        let member2 = temp.path().join("member2.pcap");
+        write_test_pcap(&member10, 10, 10, 0);
+        write_test_pcap(&member2, 2, 20, 0);
+
+        let zip_path = temp.path().join("captures.zip");
+        {
+            let zip_file = fs::File::create(&zip_path).unwrap();
+            let mut zip = ZipWriter::new(zip_file);
+            let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("z/member10.pcap", options).unwrap();
+            zip.write_all(&fs::read(&member10).unwrap()).unwrap();
+            zip.start_file("z/member2.pcap", options).unwrap();
+            zip.write_all(&fs::read(&member2).unwrap()).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let output = temp.path().join("out.pcap");
+        compact_pcap(&zip_path, &output).unwrap();
+
+        let (linktype, packets) = output_packet_summary(&output);
+        assert_eq!(linktype, Linktype::ETHERNET);
+        assert_eq!(packets, vec![(0, 0, 2), (0, 1000, 10)]);
     }
 }
