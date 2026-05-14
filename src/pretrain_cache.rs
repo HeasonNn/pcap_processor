@@ -4,7 +4,7 @@ use ndarray_npy::NpzWriter;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
@@ -248,6 +248,7 @@ fn resolve_manifest_families(manifest: &PretrainManifest) -> Result<Vec<Resolved
         ensure_manifest_path_under_root(&root, &family.family, "data", &data_path)?;
 
         let cache_path = resolve_manifest_relative_path(&root, &family.family, "cache", &family.cache)?;
+        validate_cache_existing_ancestors(&root, &family.family, &cache_path)?;
         for existing in &resolved {
             if cache_path == existing.cache_path {
                 bail!(
@@ -276,6 +277,60 @@ fn resolve_manifest_families(manifest: &PretrainManifest) -> Result<Vec<Resolved
     }
 
     Ok(resolved)
+}
+
+fn validate_cache_existing_ancestors(root: &Path, family: &str, cache_path: &Path) -> Result<()> {
+    let relative = cache_path.strip_prefix(root).with_context(|| {
+        format!(
+            "pretrain manifest family '{}' cache path is not under manifest root: {}",
+            family,
+            cache_path.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to inspect pretrain manifest family '{}' cache path ancestor: {}",
+                        family,
+                        current.display()
+                    )
+                });
+            },
+        };
+
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "pretrain manifest family '{}' cache path existing ancestor is a symlink: {}",
+                family,
+                current.display()
+            );
+        }
+
+        let canonical = current.canonicalize().with_context(|| {
+            format!(
+                "Failed to canonicalize pretrain manifest family '{}' cache path ancestor: {}",
+                family,
+                current.display()
+            )
+        })?;
+        if !canonical.starts_with(root) {
+            bail!(
+                "pretrain manifest family '{}' cache path existing ancestor resolves outside manifest root: {} -> {}",
+                family,
+                current.display(),
+                canonical.display()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_manifest_relative_path(root: &Path, family: &str, field: &str, value: &str) -> Result<PathBuf> {
@@ -940,5 +995,34 @@ mod tests {
         let err = resolve_manifest_families(&manifest).unwrap_err();
 
         assert!(err.to_string().contains("duplicate pretrain manifest cache path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_resolution_rejects_cache_path_through_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pretrain");
+        let family_dir = root.join("dohbrw");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&family_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(family_dir.join("benign.data"), b"packet data").unwrap();
+        symlink(&outside, root.join("linked")).unwrap();
+
+        let manifest = manifest(
+            &root,
+            vec![manifest_family("dohbrw", "dohbrw/benign.data", "linked/cache")],
+        );
+
+        let err = resolve_manifest_families(&manifest).unwrap_err();
+
+        assert!(
+            err.to_string().contains("cache path existing ancestor is a symlink")
+                || err
+                    .to_string()
+                    .contains("cache path existing ancestor resolves outside manifest root")
+        );
     }
 }
