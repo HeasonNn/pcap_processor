@@ -6,11 +6,11 @@
     "pretrain_families": [
       {
         "family": "ciciiot2025",
-        "shared_pcap": "data/shared_neg/CICIIOT2025_BENIGN.pcap"
+        "shared_pcap": "data/raw/CICIIoT2025/benign_data/benign/benign_whole-network3.pcap"
       },
       {
         "family": "dohbrw",
-        "glob": "data/dohbrw/benign/all"
+        "glob": "data/raw/DoHBrw-2020/BenignDoH_NonDoH/*.zip"
       },
       {
         "family": "cic_apt_iiot2024",

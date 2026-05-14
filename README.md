@@ -36,12 +36,13 @@ cargo run --release -- pretrain-cache \
   --shard-flows 50000
 ```
 
-This pretrain-only config exports each family under
-`data/pretrain_family/pretrain/<family>/` with `benign.data`, `benign.csv`, and a
-family `cache/` directory. The manifest at
-`data/pretrain_family/pretrain/manifest.json` is the entry point for cache
-generation, and `data/pretrain_family/pretrain/` is the high-level staging path
-for Hugging Face upload.
+The `process` command creates `benign.data` and `benign.csv` under each
+`data/pretrain_family/pretrain/<family>/` directory and writes
+`data/pretrain_family/pretrain/manifest.json`. DoHBrw uses raw benign ZIP inputs,
+which requires the zip-capable compact/export path implemented by this branch.
+The `pretrain-cache` command reads the manifest and creates each family `cache/`
+directory. `data/pretrain_family/pretrain/` is the high-level staging path for
+Hugging Face upload.
 
 ## Development
 
