@@ -75,6 +75,10 @@ pub enum Command {
         data: String,
         #[arg(long)]
         out_dir: String,
+        #[arg(long, default_value = "")]
+        source_name: String,
+        #[arg(long, default_value_t = 0)]
+        source_id: i16,
         #[arg(long, default_value_t = 20)]
         packet_cutoff: usize,
         #[arg(long, default_value_t = 60)]
@@ -86,11 +90,56 @@ pub enum Command {
         #[arg(long, default_value_t = 50000)]
         shard_flows: usize,
         #[arg(long, default_value_t = 0)]
+        max_packets: usize,
+        #[arg(long, default_value_t = 0)]
         max_flows: usize,
         #[arg(long, default_value_t = 256)]
         timeout_check_interval: usize,
         #[arg(long, default_value_t = 5)]
         graph_token_count: usize,
+        #[arg(long, default_value = "ns")]
+        timestamp_unit: String,
+        #[arg(long, default_value = "protocol")]
+        field7_mode: String,
+    },
+    /// Build cached token shards for few-shot fine-tuning from .data/.label files
+    FinetuneCache {
+        #[arg(long)]
+        data: String,
+        #[arg(long)]
+        labels: String,
+        #[arg(long)]
+        out_dir: String,
+        #[arg(long)]
+        source_name: String,
+        #[arg(long, default_value_t = 20)]
+        packet_cutoff: usize,
+        #[arg(long, default_value_t = 60)]
+        flow_timeout_s: u64,
+        #[arg(long, default_value_t = 300)]
+        window_duration_s: u64,
+        #[arg(long, default_value_t = 100000)]
+        window_packet_limit: usize,
+        #[arg(long, default_value_t = 4096)]
+        shard_flows: usize,
+        #[arg(long, default_value_t = 0)]
+        max_packets: usize,
+        #[arg(long, default_value_t = 256)]
+        timeout_check_interval: usize,
+        #[arg(long, default_value_t = 5)]
+        graph_token_count: usize,
+        #[arg(long, default_value = "ns")]
+        timestamp_unit: String,
+        #[arg(long, default_value = "protocol")]
+        field7_mode: String,
+        #[arg(long, default_value_t = false)]
+        attack_centered: bool,
+        #[arg(long, default_value = "flow_contaminated")]
+        label_policy: String,
+        #[arg(long, default_value_t = 20000)]
+        normal_flow_sample_size: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
 }
 
