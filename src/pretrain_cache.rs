@@ -15,6 +15,18 @@ use crate::common::{FlowKey, RawPacket};
 struct ActiveFlow {
     first_ts_ns: i64,
     packets: Vec<RawPacket>,
+    // Context snapshot as of this flow's most recent packet (= as-of-cutoff). See
+    // finetune_cache.rs for the rationale; both builders stay semantically identical.
+    ctx: Option<FlowContextSnapshot>,
+}
+
+#[derive(Clone, Default)]
+struct FlowContextSnapshot {
+    src_endpoint: WindowAgg,
+    dst_endpoint: WindowAgg,
+    service: WindowAgg,
+    edge: WindowAgg,
+    graph: [[f32; 16]; 5],
 }
 
 // Context aggregate reported to the token builder. Only the DISTINCT-flow count is
@@ -255,6 +267,23 @@ impl SlidingWindow {
             }
         }
         out
+    }
+
+    // Capture the full flow context as of the current window state, stamping recency
+    // relative to `cutoff_ts` (the flow's last packet). O(1)/O(count), no window rescan.
+    fn snapshot_for(&self, fkey: &FlowKey, graph_count: usize, cutoff_ts: i64) -> FlowContextSnapshot {
+        let service_port = service_port_from_flow_key(fkey);
+        let mut graph = [[0.0f32; 16]; 5];
+        for (idx, row) in self.graph_tokens(graph_count, cutoff_ts).into_iter().take(5).enumerate() {
+            graph[idx] = row;
+        }
+        FlowContextSnapshot {
+            src_endpoint: self.endpoint_state(&fkey.src_ip, cutoff_ts),
+            dst_endpoint: self.endpoint_state(&fkey.dst_ip, cutoff_ts),
+            service: self.service_state(service_port, fkey.protocol, cutoff_ts),
+            edge: self.edge_state(&fkey.src_ip, &fkey.dst_ip, cutoff_ts),
+            graph,
+        }
     }
 }
 
@@ -642,9 +671,10 @@ fn encode_flow(
     packets: &[RawPacket],
     packet_cutoff: usize,
     graph_token_count: usize,
-    sliding_window: &SlidingWindow,
+    ctx: &FlowContextSnapshot,
     source_id: i16,
 ) -> EncodedFlow {
+    let _ = graph_token_count;
     let real_packets = &packets[..packets.len().min(packet_cutoff)];
     let cutoff_timestamp_ns = real_packets.last().map(|p| p.ts_ns).unwrap_or(0);
 
@@ -726,10 +756,8 @@ fn encode_flow(
         }
     }
 
-    let src_endpoint = sliding_window.endpoint_state(&fkey.src_ip, cutoff_timestamp_ns);
-    let dst_endpoint = sliding_window.endpoint_state(&fkey.dst_ip, cutoff_timestamp_ns);
     let mut endpoint_tokens = [[0.0f32; 12]; 2];
-    for (idx, state) in [src_endpoint, dst_endpoint].iter().enumerate() {
+    for (idx, state) in [&ctx.src_endpoint, &ctx.dst_endpoint].iter().enumerate() {
         endpoint_tokens[idx][0] = (state.packet_count as f32 + 1.0).ln();
         endpoint_tokens[idx][1] = (state.byte_count as f32 + 1.0).ln();
         endpoint_tokens[idx][2] = (state.flow_count as f32 + 1.0).ln();
@@ -741,7 +769,7 @@ fn encode_flow(
     }
 
     let service_port = service_port_from_flow_key(fkey);
-    let service_state = sliding_window.service_state(service_port, fkey.protocol, cutoff_timestamp_ns);
+    let service_state = &ctx.service;
     let mut service_token = [0.0f32; 10];
     service_token[0] = (service_state.packet_count as f32 + 1.0).ln();
     service_token[1] = (service_state.byte_count as f32 + 1.0).ln();
@@ -755,7 +783,7 @@ fn encode_flow(
     service_token[7] = port_group(service_port);
     service_token[8] = protocol_group(fkey.protocol);
 
-    let edge_state = sliding_window.edge_state(&fkey.src_ip, &fkey.dst_ip, cutoff_timestamp_ns);
+    let edge_state = &ctx.edge;
     let mut edge_token = [0.0f32; 8];
     edge_token[0] = (edge_state.packet_count as f32 + 1.0).ln();
     edge_token[1] = (edge_state.byte_count as f32 + 1.0).ln();
@@ -772,11 +800,7 @@ fn encode_flow(
         0.0
     };
 
-    let graph_vec = sliding_window.graph_tokens(graph_token_count, cutoff_timestamp_ns);
-    let mut graph_tokens = [[0.0f32; 16]; 5];
-    for (idx, row) in graph_vec.into_iter().enumerate().take(5) {
-        graph_tokens[idx] = row;
-    }
+    let graph_tokens = ctx.graph;
 
     EncodedFlow {
         packet_tokens,
@@ -875,12 +899,13 @@ pub fn run(
                 .collect();
             for key in timeout_keys {
                 if let Some(flow) = active_flows.remove(&key) {
+                    let ctx = flow.ctx.clone().unwrap_or_default();
                     let encoded = encode_flow(
                         &key,
                         &flow.packets,
                         packet_cutoff,
                         graph_token_count,
-                        &sliding_window,
+                        &ctx,
                         source_id,
                     );
                     writer.add(encoded)?;
@@ -906,17 +931,22 @@ pub fn run(
         let flow = active_flows.entry(key.clone()).or_insert_with(|| ActiveFlow {
             first_ts_ns: packet.ts_ns,
             packets: Vec::new(),
+            ctx: None,
         });
         flow.packets.push(packet);
+        // Refresh context as of this (latest) packet; emit consumes the stored snapshot.
+        let cutoff_ts = flow.packets.last().map(|p| p.ts_ns).unwrap_or(0);
+        flow.ctx = Some(sliding_window.snapshot_for(&key, graph_token_count, cutoff_ts));
 
         if flow.packets.len() >= packet_cutoff {
             let flow = active_flows.remove(&key).unwrap();
+            let ctx = flow.ctx.clone().unwrap_or_default();
             let encoded = encode_flow(
                 &key,
                 &flow.packets,
                 packet_cutoff,
                 graph_token_count,
-                &sliding_window,
+                &ctx,
                 source_id,
             );
             writer.add(encoded)?;
@@ -942,12 +972,13 @@ pub fn run(
     if max_flows == 0 || writer.total_flows + writer.rows.len() < max_flows {
         let remaining: Vec<_> = active_flows.into_iter().collect();
         for (key, flow) in remaining {
+            let ctx = flow.ctx.clone().unwrap_or_default();
             let encoded = encode_flow(
                 &key,
                 &flow.packets,
                 packet_cutoff,
                 graph_token_count,
-                &sliding_window,
+                &ctx,
                 source_id,
             );
             writer.add(encoded)?;

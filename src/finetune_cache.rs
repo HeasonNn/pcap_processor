@@ -18,6 +18,20 @@ struct ActiveFlow {
     first_ts_ns: i64,
     order: u64,
     packets: Vec<RawPacket>,
+    // Context snapshot taken as of this flow's most recent packet (= as-of-cutoff).
+    // Refreshed on every append; consumed at emit (cutoff OR timeout). For cutoff
+    // flows this equals the emit-time window state; for timeout flows it is the
+    // window as of the flow's last packet, NOT the (~60s later) flush-time window.
+    ctx: Option<FlowContextSnapshot>,
+}
+
+#[derive(Clone, Default)]
+struct FlowContextSnapshot {
+    src_endpoint: WindowAgg,
+    dst_endpoint: WindowAgg,
+    service: WindowAgg,
+    edge: WindowAgg,
+    graph: [[f32; 16]; 5],
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -261,6 +275,24 @@ impl SlidingWindow {
             }
         }
         out
+    }
+
+    // Capture the full flow context (endpoints/service/edge/graph) as of the current
+    // window state, stamping recency relative to `cutoff_ts` (the flow's last packet).
+    // O(1) scalar lookups + O(count) graph read — no window rescan.
+    fn snapshot_for(&self, fkey: &FlowKey, graph_count: usize, cutoff_ts: i64) -> FlowContextSnapshot {
+        let service_port = service_port_from_flow_key(fkey);
+        let mut graph = [[0.0f32; 16]; 5];
+        for (idx, row) in self.graph_tokens(graph_count, cutoff_ts).into_iter().take(5).enumerate() {
+            graph[idx] = row;
+        }
+        FlowContextSnapshot {
+            src_endpoint: self.endpoint_state(&fkey.src_ip, cutoff_ts),
+            dst_endpoint: self.endpoint_state(&fkey.dst_ip, cutoff_ts),
+            service: self.service_state(service_port, fkey.protocol, cutoff_ts),
+            edge: self.edge_state(&fkey.src_ip, &fkey.dst_ip, cutoff_ts),
+            graph,
+        }
     }
 
     #[cfg(test)]
@@ -768,11 +800,12 @@ fn encode_flow(
     packets: &[RawPacket],
     packet_cutoff: usize,
     graph_token_count: usize,
-    sliding_window: &SlidingWindow,
+    ctx: &FlowContextSnapshot,
     segment_id: i32,
     attack_flow_keys: &HashSet<FlowKey>,
     label_policy: &str,
 ) -> EncodedFlow {
+    let _ = graph_token_count;
     let real_packets = &packets[..packets.len().min(packet_cutoff)];
     let cutoff_timestamp_ns = real_packets.last().map(|p| p.ts_ns).unwrap_or(0);
 
@@ -854,10 +887,8 @@ fn encode_flow(
         }
     }
 
-    let src_endpoint = sliding_window.endpoint_state(&fkey.src_ip, cutoff_timestamp_ns);
-    let dst_endpoint = sliding_window.endpoint_state(&fkey.dst_ip, cutoff_timestamp_ns);
     let mut endpoint_tokens = [[0.0f32; 12]; 2];
-    for (idx, state) in [src_endpoint, dst_endpoint].iter().enumerate() {
+    for (idx, state) in [&ctx.src_endpoint, &ctx.dst_endpoint].iter().enumerate() {
         endpoint_tokens[idx][0] = (state.packet_count as f32 + 1.0).ln();
         endpoint_tokens[idx][1] = (state.byte_count as f32 + 1.0).ln();
         endpoint_tokens[idx][2] = (state.flow_count as f32 + 1.0).ln();
@@ -869,7 +900,7 @@ fn encode_flow(
     }
 
     let service_port = service_port_from_flow_key(fkey);
-    let service_state = sliding_window.service_state(service_port, fkey.protocol, cutoff_timestamp_ns);
+    let service_state = &ctx.service;
     let mut service_token = [0.0f32; 10];
     service_token[0] = (service_state.packet_count as f32 + 1.0).ln();
     service_token[1] = (service_state.byte_count as f32 + 1.0).ln();
@@ -883,7 +914,7 @@ fn encode_flow(
     service_token[7] = port_group(service_port);
     service_token[8] = protocol_group(fkey.protocol);
 
-    let edge_state = sliding_window.edge_state(&fkey.src_ip, &fkey.dst_ip, cutoff_timestamp_ns);
+    let edge_state = &ctx.edge;
     let mut edge_token = [0.0f32; 8];
     edge_token[0] = (edge_state.packet_count as f32 + 1.0).ln();
     edge_token[1] = (edge_state.byte_count as f32 + 1.0).ln();
@@ -900,11 +931,7 @@ fn encode_flow(
         0.0
     };
 
-    let graph_vec = sliding_window.graph_tokens(graph_token_count, cutoff_timestamp_ns);
-    let mut graph_tokens = [[0.0f32; 16]; 5];
-    for (idx, row) in graph_vec.into_iter().enumerate().take(5) {
-        graph_tokens[idx] = row;
-    }
+    let graph_tokens = ctx.graph;
 
     let segment_label = if real_packets.iter().any(|packet| packet.label) {
         1
@@ -1132,13 +1159,14 @@ pub fn run(
             for (key, _) in timeout_keys {
                 if let Some(flow) = active_flows.remove(&key) {
                     let segment_id = *segment_counters.get(&key).unwrap_or(&0);
+                    let ctx = flow.ctx.clone().unwrap_or_default();
                     let encoded = encode_flow(
                         source_name,
                         &key,
                         &flow.packets,
                         packet_cutoff,
                         graph_token_count,
-                        &sliding_window,
+                        &ctx,
                         segment_id,
                         &attack_flow_keys,
                         label_policy,
@@ -1163,20 +1191,26 @@ pub fn run(
                 first_ts_ns: packet.ts_ns,
                 order,
                 packets: Vec::new(),
+                ctx: None,
             }
         });
         flow.packets.push(packet);
+        // Refresh the flow's context as of this (its latest) packet — the window
+        // already includes it. Emit (cutoff/timeout) uses this stored snapshot.
+        let cutoff_ts = flow.packets.last().map(|p| p.ts_ns).unwrap_or(0);
+        flow.ctx = Some(sliding_window.snapshot_for(&key, graph_token_count, cutoff_ts));
 
         if flow.packets.len() >= packet_cutoff {
             let flow = active_flows.remove(&key).unwrap();
             let segment_id = *segment_counters.get(&key).unwrap_or(&0);
+            let ctx = flow.ctx.clone().unwrap_or_default();
             let encoded = encode_flow(
                 source_name,
                 &key,
                 &flow.packets,
                 packet_cutoff,
                 graph_token_count,
-                &sliding_window,
+                &ctx,
                 segment_id,
                 &attack_flow_keys,
                 label_policy,
@@ -1199,13 +1233,14 @@ pub fn run(
     remaining.sort_by_key(|(_, flow)| flow.order);
     for (key, flow) in remaining {
         let segment_id = *segment_counters.get(&key).unwrap_or(&0);
+        let ctx = flow.ctx.clone().unwrap_or_default();
         let encoded = encode_flow(
             source_name,
             &key,
             &flow.packets,
             packet_cutoff,
             graph_token_count,
-            &sliding_window,
+            &ctx,
             segment_id,
             &attack_flow_keys,
             label_policy,
@@ -1368,5 +1403,35 @@ mod tests {
             window.graph_tokens(5, 2_000_000_000),
             window.scan_graph_tokens(5, 2_000_000_000)
         );
+    }
+
+    // The per-flow snapshot must freeze context as of the flow's LAST packet, so a
+    // timeout flow flushed ~60s later does NOT pick up traffic it never coexisted with.
+    #[test]
+    fn snapshot_freezes_context_at_flow_last_packet() {
+        // 300s window so nothing expires across the span below.
+        let mut window = SlidingWindow::new(300, 10_000);
+        let fkey = FlowKey::new(ip(1), ip(2), 1234, 80, 6).canonical();
+
+        // Flow A's two packets (its last packet at t=200ns).
+        window.update(packet(1, 2, 1234, 80, 6, 100, 40));
+        window.update(packet(1, 2, 1234, 80, 6, 200, 50));
+        let snap_early = window.snapshot_for(&fkey, 5, 200);
+
+        // ~60s of LATER same-edge / same-service traffic A never saw.
+        for k in 0..8 {
+            let ts = 60_000_000_000 + k as i64 * 1000;
+            window.update(packet(1, 2, 4000 + k as u16, 80, 6, ts, 60));
+        }
+        let snap_late = window.snapshot_for(&fkey, 5, 60_000_010_000);
+
+        // The early (as-of-cutoff) snapshot under-counts vs the flush-time view.
+        assert_eq!(snap_early.edge.packet_count, 2);
+        assert!(snap_late.edge.packet_count > snap_early.edge.packet_count);
+        assert!(snap_late.service.packet_count > snap_early.service.packet_count);
+        // And the frozen snapshot equals a direct as-of state taken at that instant
+        // would have (here: only A's two packets on the edge so far).
+        assert_eq!(snap_early.edge.byte_count, 90);
+        assert_eq!(snap_early.src_endpoint.flow_count, 1);
     }
 }
