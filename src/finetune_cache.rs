@@ -4,7 +4,7 @@ use ndarray_npy::NpzWriter;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
@@ -24,7 +24,11 @@ struct ActiveFlow {
 struct WindowAgg {
     packet_count: u32,
     byte_count: u64,
-    flow_keys: HashSet<FlowKey>,
+    // Only the DISTINCT-flow count is ever consumed downstream (via .len()), so we
+    // store the count directly instead of materializing the flow-key set. This makes
+    // to_window_agg O(1) on the fast path (HashMap::len) instead of cloning the whole
+    // key set — the fix for the O(F^2) blow-up on high-fan-out scan traffic.
+    flow_count: usize,
     last_seen_ns: i64,
 }
 
@@ -82,27 +86,18 @@ impl IndexedWindowAgg {
         self.events.is_empty()
     }
 
-    fn to_window_agg(&self, cutoff_timestamp_ns: i64) -> WindowAgg {
-        if self.last_seen_ns <= cutoff_timestamp_ns {
-            return WindowAgg {
-                packet_count: self.packet_count,
-                byte_count: self.byte_count,
-                flow_keys: self.flow_key_counts.keys().cloned().collect(),
-                last_seen_ns: self.last_seen_ns,
-            };
+    // Context is reported as-of the current (emit-time) window state — O(1).
+    // (Previously this recomputed as-of an arbitrary past cutoff by scanning all
+    // events, which is O(events) per query and blew up to O(F^2) on high-fan-out
+    // scans where one node accrues ~100k flows. The emit-time snapshot is the
+    // streaming-correct notion and removes the quadratic.)
+    fn current_agg(&self) -> WindowAgg {
+        WindowAgg {
+            packet_count: self.packet_count,
+            byte_count: self.byte_count,
+            flow_count: self.flow_key_counts.len(),
+            last_seen_ns: self.last_seen_ns,
         }
-
-        let mut agg = WindowAgg::default();
-        for contribution in &self.events {
-            if contribution.ts_ns > cutoff_timestamp_ns {
-                continue;
-            }
-            agg.packet_count += 1;
-            agg.byte_count += contribution.byte_count;
-            agg.flow_keys.insert(contribution.flow_key.clone());
-            agg.last_seen_ns = agg.last_seen_ns.max(contribution.ts_ns);
-        }
-        agg
     }
 }
 
@@ -113,6 +108,10 @@ struct SlidingWindow {
     endpoint_index: HashMap<IpAddr, IndexedWindowAgg>,
     service_index: HashMap<(u8, u16), IndexedWindowAgg>,
     edge_index: HashMap<(IpAddr, IpAddr), IndexedWindowAgg>,
+    // Incremental top-K index of edges, ordered by (packet_count, byte_count,
+    // last_seen_ns, edge). Lets graph_tokens read the busiest `count` edges in
+    // O(count) instead of scanning every edge per emit (the O(F^2) source).
+    edge_rank: BTreeSet<(u32, u64, i64, IpAddr, IpAddr)>,
 }
 
 impl SlidingWindow {
@@ -124,6 +123,7 @@ impl SlidingWindow {
             endpoint_index: HashMap::new(),
             service_index: HashMap::new(),
             edge_index: HashMap::new(),
+            edge_rank: BTreeSet::new(),
         }
     }
 
@@ -159,10 +159,18 @@ impl SlidingWindow {
                 .add_packet(packet);
         }
 
-        self.edge_index
-            .entry(canonical_edge_key(&packet.src_ip, &packet.dst_ip))
-            .or_default()
-            .add_packet(packet);
+        let ekey = canonical_edge_key(&packet.src_ip, &packet.dst_ip);
+        let (old, new) = {
+            let agg = self.edge_index.entry(ekey).or_default();
+            let old = (agg.packet_count > 0)
+                .then(|| (agg.packet_count, agg.byte_count, agg.last_seen_ns));
+            agg.add_packet(packet);
+            (old, (agg.packet_count, agg.byte_count, agg.last_seen_ns))
+        };
+        if let Some((pc, bc, ls)) = old {
+            self.edge_rank.remove(&(pc, bc, ls, ekey.0, ekey.1));
+        }
+        self.edge_rank.insert((new.0, new.1, new.2, ekey.0, ekey.1));
     }
 
     fn remove_from_indices(&mut self, packet: &RawPacket) {
@@ -176,11 +184,25 @@ impl SlidingWindow {
             Self::remove_from_index(&mut self.service_index, &(packet.protocol, packet.dst_port), packet);
         }
 
-        Self::remove_from_index(
-            &mut self.edge_index,
-            &canonical_edge_key(&packet.src_ip, &packet.dst_ip),
-            packet,
-        );
+        let ekey = canonical_edge_key(&packet.src_ip, &packet.dst_ip);
+        let update = self.edge_index.get_mut(&ekey).map(|agg| {
+            let old = (agg.packet_count, agg.byte_count, agg.last_seen_ns);
+            agg.remove_packet(packet);
+            let new = (!agg.is_empty())
+                .then(|| (agg.packet_count, agg.byte_count, agg.last_seen_ns));
+            (old, new)
+        });
+        if let Some((old, new)) = update {
+            self.edge_rank.remove(&(old.0, old.1, old.2, ekey.0, ekey.1));
+            match new {
+                Some((pc, bc, ls)) => {
+                    self.edge_rank.insert((pc, bc, ls, ekey.0, ekey.1));
+                }
+                None => {
+                    self.edge_index.remove(&ekey);
+                }
+            }
+        }
     }
 
     fn remove_from_index<K>(index: &mut HashMap<K, IndexedWindowAgg>, key: &K, packet: &RawPacket)
@@ -201,40 +223,39 @@ impl SlidingWindow {
     fn endpoint_state(&self, ip: &IpAddr, cutoff_timestamp_ns: i64) -> WindowAgg {
         self.endpoint_index
             .get(ip)
-            .map(|agg| agg.to_window_agg(cutoff_timestamp_ns))
+            .map(|agg| agg.current_agg())
             .unwrap_or_default()
     }
 
     fn service_state(&self, port: u16, protocol: u8, cutoff_timestamp_ns: i64) -> WindowAgg {
         self.service_index
             .get(&(protocol, port))
-            .map(|agg| agg.to_window_agg(cutoff_timestamp_ns))
+            .map(|agg| agg.current_agg())
             .unwrap_or_default()
     }
 
     fn edge_state(&self, src_ip: &IpAddr, dst_ip: &IpAddr, cutoff_timestamp_ns: i64) -> WindowAgg {
         self.edge_index
             .get(&canonical_edge_key(src_ip, dst_ip))
-            .map(|agg| agg.to_window_agg(cutoff_timestamp_ns))
+            .map(|agg| agg.current_agg())
             .unwrap_or_default()
     }
 
     fn graph_tokens(&self, count: usize, cutoff_timestamp_ns: i64) -> Vec<[f32; 16]> {
-        let mut edges: Vec<_> = self
-            .edge_index
-            .values()
-            .map(|agg| agg.to_window_agg(cutoff_timestamp_ns))
-            .filter(|agg| agg.packet_count > 0)
-            .collect();
-        edges.sort_by(|a, b| {
-            (b.packet_count, b.byte_count, b.last_seen_ns).cmp(&(a.packet_count, a.byte_count, a.last_seen_ns))
-        });
-
+        // Top-`count` busiest edges, read directly from the incremental rank index.
         let mut out = vec![[0.0f32; 16]; count];
-        for (idx, agg) in edges.into_iter().take(count).enumerate() {
+        for (idx, &(packet_count, byte_count, last_seen_ns, a, b)) in
+            self.edge_rank.iter().rev().take(count).enumerate()
+        {
+            let flow_count = self
+                .edge_index
+                .get(&(a, b))
+                .map(|agg| agg.flow_key_counts.len())
+                .unwrap_or(0);
+            let agg = WindowAgg { packet_count, byte_count, flow_count, last_seen_ns };
             out[idx][0] = (agg.packet_count as f32 + 1.0).ln();
             out[idx][1] = (agg.byte_count as f32 + 1.0).ln();
-            out[idx][2] = (agg.flow_keys.len() as f32 + 1.0).ln();
+            out[idx][2] = (agg.flow_count as f32 + 1.0).ln();
             if agg.last_seen_ns > 0 {
                 out[idx][3] = ((cutoff_timestamp_ns - agg.last_seen_ns).max(0) as f32 + 1.0).ln();
             }
@@ -245,70 +266,70 @@ impl SlidingWindow {
     #[cfg(test)]
     fn scan_endpoint_state(&self, ip: &IpAddr, cutoff_timestamp_ns: i64) -> WindowAgg {
         let mut agg = WindowAgg::default();
+        let mut seen: HashSet<FlowKey> = HashSet::new();
         for packet in &self.events {
-            if packet.ts_ns > cutoff_timestamp_ns {
-                continue;
-            }
             if &packet.src_ip == ip || &packet.dst_ip == ip {
                 agg.packet_count += 1;
                 agg.byte_count += packet.len as u64;
-                agg.flow_keys.insert(packet_flow_key(packet));
+                seen.insert(packet_flow_key(packet));
                 agg.last_seen_ns = agg.last_seen_ns.max(packet.ts_ns);
             }
         }
+        agg.flow_count = seen.len();
         agg
     }
 
     #[cfg(test)]
     fn scan_service_state(&self, port: u16, protocol: u8, cutoff_timestamp_ns: i64) -> WindowAgg {
         let mut agg = WindowAgg::default();
+        let mut seen: HashSet<FlowKey> = HashSet::new();
         for packet in &self.events {
-            if packet.ts_ns > cutoff_timestamp_ns {
-                continue;
-            }
             if packet.protocol == protocol && (packet.dst_port == port || packet.src_port == port) {
                 agg.packet_count += 1;
                 agg.byte_count += packet.len as u64;
-                agg.flow_keys.insert(packet_flow_key(packet));
+                seen.insert(packet_flow_key(packet));
                 agg.last_seen_ns = agg.last_seen_ns.max(packet.ts_ns);
             }
         }
+        agg.flow_count = seen.len();
         agg
     }
 
     #[cfg(test)]
     fn scan_edge_state(&self, src_ip: &IpAddr, dst_ip: &IpAddr, cutoff_timestamp_ns: i64) -> WindowAgg {
         let mut agg = WindowAgg::default();
+        let mut seen: HashSet<FlowKey> = HashSet::new();
         for packet in &self.events {
-            if packet.ts_ns > cutoff_timestamp_ns {
-                continue;
-            }
             if canonical_edge_key(&packet.src_ip, &packet.dst_ip) == canonical_edge_key(src_ip, dst_ip) {
                 agg.packet_count += 1;
                 agg.byte_count += packet.len as u64;
-                agg.flow_keys.insert(packet_flow_key(packet));
+                seen.insert(packet_flow_key(packet));
                 agg.last_seen_ns = agg.last_seen_ns.max(packet.ts_ns);
             }
         }
+        agg.flow_count = seen.len();
         agg
     }
 
     #[cfg(test)]
     fn scan_graph_tokens(&self, count: usize, cutoff_timestamp_ns: i64) -> Vec<[f32; 16]> {
-        let mut map: HashMap<(IpAddr, IpAddr), WindowAgg> = HashMap::new();
+        let mut map: HashMap<(IpAddr, IpAddr), (WindowAgg, HashSet<FlowKey>)> = HashMap::new();
         for packet in &self.events {
-            if packet.ts_ns > cutoff_timestamp_ns {
-                continue;
-            }
             let key = canonical_edge_key(&packet.src_ip, &packet.dst_ip);
-            let agg = map.entry(key).or_default();
+            let (agg, seen) = map.entry(key).or_default();
             agg.packet_count += 1;
             agg.byte_count += packet.len as u64;
-            agg.flow_keys.insert(packet_flow_key(packet));
+            seen.insert(packet_flow_key(packet));
             agg.last_seen_ns = agg.last_seen_ns.max(packet.ts_ns);
         }
 
-        let mut edges: Vec<_> = map.into_values().collect();
+        let mut edges: Vec<WindowAgg> = map
+            .into_values()
+            .map(|(mut agg, seen)| {
+                agg.flow_count = seen.len();
+                agg
+            })
+            .collect();
         edges.sort_by(|a, b| {
             (b.packet_count, b.byte_count, b.last_seen_ns).cmp(&(a.packet_count, a.byte_count, a.last_seen_ns))
         });
@@ -317,7 +338,7 @@ impl SlidingWindow {
         for (idx, agg) in edges.into_iter().take(count).enumerate() {
             out[idx][0] = (agg.packet_count as f32 + 1.0).ln();
             out[idx][1] = (agg.byte_count as f32 + 1.0).ln();
-            out[idx][2] = (agg.flow_keys.len() as f32 + 1.0).ln();
+            out[idx][2] = (agg.flow_count as f32 + 1.0).ln();
             if agg.last_seen_ns > 0 {
                 out[idx][3] = ((cutoff_timestamp_ns - agg.last_seen_ns).max(0) as f32 + 1.0).ln();
             }
@@ -839,12 +860,12 @@ fn encode_flow(
     for (idx, state) in [src_endpoint, dst_endpoint].iter().enumerate() {
         endpoint_tokens[idx][0] = (state.packet_count as f32 + 1.0).ln();
         endpoint_tokens[idx][1] = (state.byte_count as f32 + 1.0).ln();
-        endpoint_tokens[idx][2] = (state.flow_keys.len() as f32 + 1.0).ln();
+        endpoint_tokens[idx][2] = (state.flow_count as f32 + 1.0).ln();
         if state.last_seen_ns > 0 {
             endpoint_tokens[idx][3] = ((cutoff_timestamp_ns - state.last_seen_ns).max(0) as f32 + 1.0).ln();
         }
         endpoint_tokens[idx][4] = (safe_ratio(state.byte_count as f32, state.packet_count as f32) + 1.0).ln();
-        endpoint_tokens[idx][5] = (safe_ratio(state.packet_count as f32, state.flow_keys.len() as f32) + 1.0).ln();
+        endpoint_tokens[idx][5] = (safe_ratio(state.packet_count as f32, state.flow_count as f32) + 1.0).ln();
     }
 
     let service_port = service_port_from_flow_key(fkey);
@@ -852,13 +873,13 @@ fn encode_flow(
     let mut service_token = [0.0f32; 10];
     service_token[0] = (service_state.packet_count as f32 + 1.0).ln();
     service_token[1] = (service_state.byte_count as f32 + 1.0).ln();
-    service_token[2] = (service_state.flow_keys.len() as f32 + 1.0).ln();
+    service_token[2] = (service_state.flow_count as f32 + 1.0).ln();
     if service_state.last_seen_ns > 0 {
         service_token[3] = ((cutoff_timestamp_ns - service_state.last_seen_ns).max(0) as f32 + 1.0).ln();
     }
     service_token[4] = (safe_ratio(service_state.byte_count as f32, service_state.packet_count as f32) + 1.0).ln();
-    service_token[5] = (safe_ratio(service_state.packet_count as f32, service_state.flow_keys.len() as f32) + 1.0).ln();
-    service_token[6] = safe_ratio(service_state.flow_keys.len() as f32, service_state.packet_count as f32);
+    service_token[5] = (safe_ratio(service_state.packet_count as f32, service_state.flow_count as f32) + 1.0).ln();
+    service_token[6] = safe_ratio(service_state.flow_count as f32, service_state.packet_count as f32);
     service_token[7] = port_group(service_port);
     service_token[8] = protocol_group(fkey.protocol);
 
@@ -866,12 +887,12 @@ fn encode_flow(
     let mut edge_token = [0.0f32; 8];
     edge_token[0] = (edge_state.packet_count as f32 + 1.0).ln();
     edge_token[1] = (edge_state.byte_count as f32 + 1.0).ln();
-    edge_token[2] = (edge_state.flow_keys.len() as f32 + 1.0).ln();
+    edge_token[2] = (edge_state.flow_count as f32 + 1.0).ln();
     if edge_state.last_seen_ns > 0 {
         edge_token[3] = ((cutoff_timestamp_ns - edge_state.last_seen_ns).max(0) as f32 + 1.0).ln();
     }
     edge_token[4] = (safe_ratio(edge_state.byte_count as f32, edge_state.packet_count as f32) + 1.0).ln();
-    edge_token[5] = (safe_ratio(edge_state.packet_count as f32, edge_state.flow_keys.len() as f32) + 1.0).ln();
+    edge_token[5] = (safe_ratio(edge_state.packet_count as f32, edge_state.flow_count as f32) + 1.0).ln();
     edge_token[6] = safe_ratio(real_packets.len() as f32, edge_state.packet_count as f32);
     edge_token[7] = if real_packets.iter().any(|packet| packet.src_ip != fkey.src_ip) {
         1.0
@@ -1294,7 +1315,7 @@ mod tests {
     fn assert_agg_eq(actual: WindowAgg, expected: WindowAgg) {
         assert_eq!(actual.packet_count, expected.packet_count);
         assert_eq!(actual.byte_count, expected.byte_count);
-        assert_eq!(actual.flow_keys, expected.flow_keys);
+        assert_eq!(actual.flow_count, expected.flow_count);
         assert_eq!(actual.last_seen_ns, expected.last_seen_ns);
     }
 
@@ -1331,7 +1352,7 @@ mod tests {
         let endpoint = window.endpoint_state(&ip(1), 300);
         assert_eq!(endpoint.packet_count, 1);
         assert_eq!(endpoint.byte_count, 50);
-        assert_eq!(endpoint.flow_keys.len(), 1);
+        assert_eq!(endpoint.flow_count, 1);
     }
 
     #[test]
